@@ -1,0 +1,1084 @@
+#!/usr/bin/env python3
+"""Universal HarmonyOS PC (OpenHarmony Stage) HAP Builder & Packager for GPUI apps.
+
+Features:
+- Accepts either `ohos-app.json`, a `Cargo.toml` with `[package.metadata.ohos]` /
+  `[workspace.metadata.ohos]`, or a directory containing either.
+- Zero hardcoded user/machine paths: auto-discovers OHOS LLVM NDK, HMOS CLT (hvigor/ohpm/hnpcli),
+  `hda` signer, `hdc` debugger, `cargo`, and `binary-sign-tool` via env vars and standard paths.
+- Out-of-tree staging & caching (`~/.cache/gpui-ohos-packager`): keeps `gpui-ohos` 100% git-clean,
+  reuses `oh_modules` across apps, and repacks updated `.so` / `.hnp` payloads into cached
+  unsigned shell HAPs in <0.5s.
+- Supports primary + extra Rust/prebuilt `.so` libraries (`extraCargoTargets`, `extraLibs`),
+  bundled `.hnp` native packages (`hnpPackages` + `hnpcli`), `rawfile`/`resfile` assets,
+  custom ArkTS bridges (`extraEts`, `abilityImports`, `abilityPlugins`), and automatic
+  fallback for restricted optional ACLs (`optionalAcls`).
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+import zipfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+PACKAGER_ROOT = Path(__file__).resolve().parent
+TEMPLATE_HOST_DIR = PACKAGER_ROOT / "host"
+SVG2PNG_TOOL_DIR = PACKAGER_ROOT / "tools" / "svg2png"
+
+
+def _camel_key(key: str) -> str:
+    parts = key.split("_")
+    return parts[0] + "".join(p.capitalize() for p in parts[1:])
+
+
+def _normalize_keys(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        out: dict[str, Any] = {}
+        for k, v in obj.items():
+            norm_v = _normalize_keys(v)
+            out[k] = norm_v
+            ck = _camel_key(k)
+            if ck not in out:
+                out[ck] = norm_v
+        return out
+    if isinstance(obj, list):
+        return [_normalize_keys(x) for x in obj]
+    return obj
+
+
+@dataclass(frozen=True)
+class Toolchains:
+    ohos_sdk: Path
+    clt_root: Path | None
+    cargo_bin: str
+    hda_bin: Path | None
+    hdc_bin: str | None
+    hnpcli_bin: Path | None
+    sign_tool_bin: Path | None
+    safe_tmpdir: Path
+
+
+def _latest_glob(parent: Path, pattern: str) -> Path | None:
+    if not parent.is_dir():
+        return None
+    matches = sorted(p for p in parent.glob(pattern) if p.exists())
+    return matches[-1] if matches else None
+
+
+def discover_toolchains() -> Toolchains:
+    home = Path.home()
+    brew_prefix = Path(os.environ.get("HOMEBREW_PREFIX") or (home / ".harmonybrew"))
+
+    # 1. Discover HMOS Command Line Tools (CLT)
+    clt_candidates: list[Path] = []
+    if env_clt := os.environ.get("HMOS_CLT_ROOT"):
+        clt_candidates.append(Path(env_clt))
+    if env_deveco := os.environ.get("DEVECO_SDK_HOME"):
+        p = Path(env_deveco)
+        clt_candidates.append(p.parent if p.name == "sdk" else p)
+    if found_clt := _latest_glob(Path("/data/service/hnp/hmos-clt.org"), "hmos-clt_*"):
+        clt_candidates.append(found_clt)
+    clt_root = next((p.resolve() for p in clt_candidates if (p / "sdk").is_dir()), None)
+
+    # 2. Discover OHOS NDK / LLVM SDK (prefer code-signing LLVM when present)
+    sdk_candidates: list[Path] = []
+    for var in ("OHOS_SDK_ROOT", "OHOS_NDK_HOME"):
+        if val := os.environ.get(var):
+            sdk_candidates.append(Path(val))
+    sdk_candidates.append(brew_prefix / "opt/ohos-sdk")
+    if clt_root:
+        sdk_candidates.append(clt_root / "sdk/default/openharmony")
+    ohos_sdk = next((p.resolve() for p in sdk_candidates if (p / "native/llvm/bin/clang").is_file()), None)
+    if ohos_sdk is None:
+        raise FileNotFoundError(
+            "Could not locate OpenHarmony native SDK (clang). Set OHOS_SDK_ROOT or install ohos-sdk."
+        )
+
+    # 3. Discover cargo
+    cargo_bin = (
+        os.environ.get("CARGO")
+        or shutil.which("cargo")
+        or next(
+            (
+                str(p)
+                for p in (brew_prefix / "bin/cargo", home / ".cargo/bin/cargo")
+                if p.is_file()
+            ),
+            "cargo",
+        )
+    )
+
+    # 4. Discover hda (HAP signer/installer)
+    hda_candidates: list[Path] = []
+    if env_hda := os.environ.get("HDA_BIN"):
+        hda_candidates.append(Path(env_hda))
+    if which_hda := shutil.which("hda"):
+        hda_candidates.append(Path(which_hda))
+    hda_candidates.append(Path("/data/service/hnp/bin/hda"))
+    if hnp_hda := _latest_glob(Path("/data/service/hnp/hda.org"), "hda_*"):
+        hda_candidates.append(hnp_hda / "bin/hda")
+    hda_bin = next((p for p in hda_candidates if p.is_file()), None)
+
+    # 5. Discover hdc
+    hdc_bin = os.environ.get("HDC_BIN") or shutil.which("hdc")
+    if not hdc_bin:
+        for cand in (
+            brew_prefix / "bin/hdc",
+            clt_root / "sdk/default/openharmony/toolchains/hdc" if clt_root else None,
+        ):
+            if cand and cand.is_file():
+                hdc_bin = str(cand)
+                break
+
+    # 6. Discover hnpcli
+    hnpcli_candidates: list[Path] = []
+    if env_hnpcli := os.environ.get("HNPCLI_BIN"):
+        hnpcli_candidates.append(Path(env_hnpcli))
+    if which_hnpcli := shutil.which("hnpcli"):
+        hnpcli_candidates.append(Path(which_hnpcli))
+    if clt_root:
+        hnpcli_candidates.append(clt_root / "sdk/default/openharmony/toolchains/hnpcli")
+    hnpcli_candidates.append(ohos_sdk / "toolchains/hnpcli")
+    hnpcli_bin = next((p for p in hnpcli_candidates if p.is_file()), None)
+
+    # 7. Discover ELF self-sign tool (optional, for standalone binaries inside HNPs)
+    sign_candidates: list[Path] = []
+    if env_sign := os.environ.get("BINARY_SIGN_TOOL"):
+        sign_candidates.append(Path(env_sign))
+    for name in ("binary-sign-tool-fix", "binary-sign-tool"):
+        if w := shutil.which(name):
+            sign_candidates.append(Path(w))
+        sign_candidates.append(brew_prefix / "bin" / name)
+    sign_tool_bin = next((p for p in sign_candidates if p.is_file()), None)
+
+    # 8. Safe IPC/temp directory (HarmonyOS app sandbox /tmp blocks UNIX sockets/FIFOs)
+    ohos_private_tmp = Path("/data/storage/el2/base/haps/entry/temp")
+    if ohos_private_tmp.parent.is_dir():
+        ohos_private_tmp.mkdir(parents=True, exist_ok=True)
+        safe_tmpdir = ohos_private_tmp
+    else:
+        safe_tmpdir = Path(tempfile.gettempdir())
+
+    return Toolchains(
+        ohos_sdk=ohos_sdk,
+        clt_root=clt_root,
+        cargo_bin=cargo_bin,
+        hda_bin=hda_bin,
+        hdc_bin=hdc_bin,
+        hnpcli_bin=hnpcli_bin,
+        sign_tool_bin=sign_tool_bin,
+        safe_tmpdir=safe_tmpdir,
+    )
+
+
+def default_cache_dir() -> Path:
+    if env_cache := os.environ.get("GPUI_OHOS_CACHE_DIR"):
+        return Path(env_cache).expanduser().resolve()
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    base = Path(xdg).expanduser() if xdg else (Path.home() / ".cache")
+    return (base / "gpui-ohos-packager").resolve()
+
+
+def resolve_path(raw: str | Path, base_dir: Path) -> Path:
+    p = Path(os.path.expandvars(str(raw))).expanduser()
+    if not p.is_absolute():
+        p = base_dir / p
+    return p.resolve()
+
+
+def load_app_spec(target: str) -> tuple[dict[str, Any], Path]:
+    arg_path = Path(target).expanduser()
+    if arg_path.is_dir():
+        if (arg_path / "ohos-app.json").is_file():
+            spec_file = (arg_path / "ohos-app.json").resolve()
+        elif (arg_path / "Cargo.toml").is_file():
+            spec_file = (arg_path / "Cargo.toml").resolve()
+        else:
+            raise FileNotFoundError(f"No ohos-app.json or Cargo.toml found in {arg_path}")
+    elif arg_path.is_file():
+        spec_file = arg_path.resolve()
+    else:
+        raise FileNotFoundError(f"App config path does not exist: {target!r}")
+
+    spec_dir = spec_file.parent
+    if spec_file.name == "Cargo.toml":
+        cargo_doc = tomllib.loads(spec_file.read_text(encoding="utf-8"))
+        pkg = cargo_doc.get("package", {})
+        meta = (
+            pkg.get("metadata", {}).get("ohos")
+            or cargo_doc.get("workspace", {}).get("metadata", {}).get("ohos")
+        )
+        if not isinstance(meta, dict):
+            raise ValueError(
+                f"{spec_file} does not define [package.metadata.ohos] or [workspace.metadata.ohos]"
+            )
+        spec = _normalize_keys(meta)
+        spec.setdefault("name", pkg.get("name", spec_dir.name))
+        spec.setdefault("versionName", pkg.get("version", "0.1.0"))
+        spec.setdefault("manifestPath", str(spec_file))
+    else:
+        raw = json.loads(spec_file.read_text(encoding="utf-8"))
+        spec = _normalize_keys(raw)
+        if "manifestPath" not in spec and (spec_dir / "Cargo.toml").is_file():
+            spec["manifestPath"] = str((spec_dir / "Cargo.toml").resolve())
+
+    for required in ("name", "bundleName", "appName"):
+        if not spec.get(required):
+            raise ValueError(f"Missing required field {required!r} in {spec_file}")
+
+    return spec, spec_dir
+
+
+def write_if_changed(path: Path, content: str) -> bool:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and path.read_text(encoding="utf-8") == content:
+        return False
+    path.write_text(content, encoding="utf-8")
+    return True
+
+
+def write_bytes_if_changed(path: Path, data: bytes) -> bool:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and path.read_bytes() == data:
+        return False
+    path.write_bytes(data)
+    return True
+
+
+def run_cmd(
+    cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None
+) -> None:
+    print(f"==> {' '.join(cmd)}", flush=True)
+    subprocess.run(cmd, cwd=cwd, env=env, check=True)
+
+
+def ensure_svg2png_tool(tc: Toolchains, cache_dir: Path) -> Path:
+    target_dir = cache_dir / "tools-target" / "svg2png"
+    bin_path = target_dir / "release" / "svg2png"
+    if bin_path.is_file():
+        return bin_path
+    llvm_bin = tc.ohos_sdk / "native/llvm/bin"
+    env = os.environ.copy()
+    env.update(
+        {
+            "CC": str(llvm_bin / "clang"),
+            "CXX": str(llvm_bin / "clang++"),
+            "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_OHOS_LINKER": str(llvm_bin / "clang"),
+            "CARGO_TARGET_DIR": str(target_dir),
+            "TMPDIR": str(tc.safe_tmpdir),
+        }
+    )
+    run_cmd(
+        [
+            tc.cargo_bin,
+            "build",
+            "--release",
+            "--manifest-path",
+            str(SVG2PNG_TOOL_DIR / "Cargo.toml"),
+        ],
+        cwd=SVG2PNG_TOOL_DIR,
+        env=env,
+    )
+    return bin_path
+
+
+def _fallback_solid_png(size: int = 1024, rgba: tuple[int, int, int, int] = (24, 24, 27, 255)) -> bytes:
+    """Minimal pure-stdlib PNG generator when Pillow is unavailable and no PNG icon is supplied."""
+    import struct
+    import zlib
+
+    row = b"\x00" + bytes(rgba) * size
+    raw_scanlines = row * size
+
+    def chunk(tag: bytes, payload: bytes) -> bytes:
+        crc = zlib.crc32(tag + payload) & 0xFFFFFFFF
+        return struct.pack(">I", len(payload)) + tag + payload + struct.pack(">I", crc)
+
+    ihdr = struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0)
+    idat = zlib.compress(raw_scanlines, level=6)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
+
+
+def render_app_icon(spec: dict[str, Any], spec_dir: Path, tc: Toolchains, cache_dir: Path, stage_dir: Path) -> None:
+    icon_spec = spec.get("icon")
+    icon_bg = spec.get("iconBackground")
+    icon_scale = float(spec.get("iconScale", 1.0))
+    size = 1024
+    radius = 184
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_key = hashlib.sha256()
+    if icon_spec:
+        src_path = resolve_path(icon_spec, spec_dir)
+        if not src_path.is_file():
+            raise FileNotFoundError(f"App icon not found: {src_path}")
+        cache_key.update(src_path.read_bytes())
+        cache_key.update(f"|bg={icon_bg}|scale={icon_scale}".encode("utf-8"))
+    else:
+        src_path = None
+        cache_key.update(f"default|{spec['appName']}|{icon_bg}".encode("utf-8"))
+
+    cached_png = cache_dir / f"icon-{cache_key.hexdigest()[:16]}.png"
+    if cached_png.is_file():
+        png_bytes = cached_png.read_bytes()
+    else:
+        try:
+            from io import BytesIO
+            from PIL import Image, ImageColor, ImageDraw
+        except ImportError:
+            if src_path and src_path.suffix.lower() == ".png":
+                png_bytes = src_path.read_bytes()
+            elif src_path and src_path.suffix.lower() == ".svg":
+                svg2png = ensure_svg2png_tool(tc, cache_dir)
+                tmp_png = cache_dir / "tmp-raster.png"
+                run_cmd([str(svg2png), str(src_path), str(tmp_png), str(size)])
+                png_bytes = tmp_png.read_bytes()
+                tmp_png.unlink(missing_ok=True)
+            else:
+                png_bytes = _fallback_solid_png(size)
+            cached_png.write_bytes(png_bytes)
+            write_bytes_if_changed(stage_dir / "AppScope/resources/base/media/app_icon.png", png_bytes)
+            return
+
+        if src_path is None:
+            bg_rgba = ImageColor.getrgb(icon_bg) if icon_bg else (26, 27, 38, 255)
+            if len(bg_rgba) == 3:
+                bg_rgba = (*bg_rgba, 255)
+            img = Image.new("RGBA", (size, size), bg_rgba)
+        elif src_path.suffix.lower() == ".svg":
+            svg2png = ensure_svg2png_tool(tc, cache_dir)
+            tmp_png = cache_dir / "tmp-raster.png"
+            render_px = max(64, min(size, round(size * icon_scale)))
+            run_cmd([str(svg2png), str(src_path), str(tmp_png), str(render_px)])
+            fg = Image.open(tmp_png).convert("RGBA")
+            tmp_png.unlink(missing_ok=True)
+            if icon_bg or render_px != size:
+                bg_rgba = ImageColor.getrgb(icon_bg) if icon_bg else (0, 0, 0, 0)
+                if len(bg_rgba) == 3:
+                    bg_rgba = (*bg_rgba, 255)
+                img = Image.new("RGBA", (size, size), bg_rgba)
+                offset = ((size - fg.width) // 2, (size - fg.height) // 2)
+                img.alpha_composite(fg, offset)
+            else:
+                img = fg
+        else:
+            raw = Image.open(src_path)
+            if getattr(raw, "format", "") == "ICO" and "sizes" in raw.info:
+                best = max(raw.info["sizes"], key=lambda s: s[0] * s[1])
+                raw.size = best
+            fg = raw.convert("RGBA")
+            render_px = max(64, min(size, round(size * icon_scale)))
+            fg = fg.resize((render_px, render_px), Image.Resampling.LANCZOS)
+            if icon_bg or render_px != size:
+                bg_rgba = ImageColor.getrgb(icon_bg) if icon_bg else (0, 0, 0, 0)
+                if len(bg_rgba) == 3:
+                    bg_rgba = (*bg_rgba, 255)
+                img = Image.new("RGBA", (size, size), bg_rgba)
+                offset = ((size - fg.width) // 2, (size - fg.height) // 2)
+                img.alpha_composite(fg, offset)
+            else:
+                img = fg
+
+        corner_alpha = max(
+            img.getpixel((0, 0))[3],
+            img.getpixel((size - 1, 0))[3],
+            img.getpixel((0, size - 1))[3],
+            img.getpixel((size - 1, size - 1))[3],
+        )
+        if corner_alpha > 0:
+            ss = 4
+            mask_hi = Image.new("L", (size * ss, size * ss), 0)
+            draw = ImageDraw.Draw(mask_hi)
+            draw.rounded_rectangle(
+                (0, 0, size * ss - 1, size * ss - 1), radius=radius * ss, fill=255
+            )
+            mask = mask_hi.resize((size, size), Image.Resampling.LANCZOS)
+            r, g, b, a = img.split()
+            a = Image.composite(a, Image.new("L", (size, size), 0), mask)
+            img = Image.merge("RGBA", (r, g, b, a))
+
+        buf = BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+        png_bytes = buf.getvalue()
+        cached_png.write_bytes(png_bytes)
+
+    write_bytes_if_changed(stage_dir / "AppScope/resources/base/media/app_icon.png", png_bytes)
+
+
+def sync_template_to_stage(stage_dir: Path) -> None:
+    """Sync clean `host/` template files into `stage_dir`, preserving `oh_modules`."""
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    for src in sorted(TEMPLATE_HOST_DIR.rglob("*")):
+        rel = src.relative_to(TEMPLATE_HOST_DIR)
+        dst = stage_dir / rel
+        if src.is_dir():
+            dst.mkdir(parents=True, exist_ok=True)
+        else:
+            write_bytes_if_changed(dst, src.read_bytes())
+
+    # Clean up stale app-specific extra ETS or rawfiles from previous apps
+    for extra_sub in (
+        stage_dir / "entry/src/main/ets/extra",
+        stage_dir / "entry/src/main/resources/rawfile",
+        stage_dir / "entry/src/main/resources/resfile",
+        stage_dir / "entry/hnp",
+    ):
+        if extra_sub.exists():
+            shutil.rmtree(extra_sub)
+
+
+def resolve_hnp_packages(
+    spec: dict[str, Any], spec_dir: Path, tc: Toolchains, force_hnp: bool = False
+) -> list[tuple[Path, str]]:
+    """Resolve (and optionally build) `.hnp` archives declared in `hnpPackages`."""
+    resolved: list[tuple[Path, str]] = []
+    for item in spec.get("hnpPackages", []):
+        if isinstance(item, str):
+            hnp_path = resolve_path(item, spec_dir)
+            hnp_type = "private"
+        else:
+            hnp_type = item.get("type", "private")
+            hnp_path = resolve_path(item["path"], spec_dir)
+            build_cmd = item.get("buildCmd")
+            if build_cmd and (force_hnp or not hnp_path.is_file()):
+                cmd_list = (
+                    ["/bin/sh", "-c", build_cmd]
+                    if isinstance(build_cmd, str)
+                    else [str(x) for x in build_cmd]
+                )
+                env = os.environ.copy()
+                env["TMPDIR"] = str(tc.safe_tmpdir)
+                if tc.hnpcli_bin:
+                    env.setdefault("HNPCLI_BIN", str(tc.hnpcli_bin))
+                if tc.sign_tool_bin:
+                    env.setdefault("BINARY_SIGN_TOOL", str(tc.sign_tool_bin))
+                env.setdefault("OHOS_SDK_ROOT", str(tc.ohos_sdk))
+                run_cmd(cmd_list, cwd=spec_dir, env=env)
+
+        if not hnp_path.is_file():
+            raise FileNotFoundError(f"Declared HNP archive not found: {hnp_path}")
+        resolved.append((hnp_path, hnp_type))
+    return resolved
+
+
+def prepare_stage_metadata(
+    spec: dict[str, Any],
+    spec_dir: Path,
+    tc: Toolchains,
+    cache_dir: Path,
+    stage_dir: Path,
+    hnp_items: list[tuple[Path, str]],
+) -> None:
+    sync_template_to_stage(stage_dir)
+    render_app_icon(spec, spec_dir, tc, cache_dir, stage_dir)
+
+    start_bg = spec.get("startWindowBackground", "#18181B")
+    write_if_changed(
+        stage_dir / "entry/src/main/resources/base/element/color.json",
+        json.dumps(
+            {"color": [{"name": "start_window_background", "value": start_bg}]},
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+    )
+
+    # Extra custom string resources if requested
+    base_strings = json.loads(
+        (TEMPLATE_HOST_DIR / "entry/src/main/resources/base/element/string.json").read_text(
+            encoding="utf-8"
+        )
+    )["string"]
+    existing_names = {entry["name"] for entry in base_strings}
+    for k, v in spec.get("strings", {}).items():
+        if k in existing_names:
+            for entry in base_strings:
+                if entry["name"] == k:
+                    entry["value"] = v
+        else:
+            base_strings.append({"name": k, "value": v})
+    write_if_changed(
+        stage_dir / "entry/src/main/resources/base/element/string.json",
+        json.dumps({"string": base_strings}, indent=2, ensure_ascii=False) + "\n",
+    )
+
+    # Custom ArkTS files & EntryAbility hooks
+    for ets_entry in spec.get("extraEts", []):
+        if isinstance(ets_entry, str):
+            src_ets = resolve_path(ets_entry, spec_dir)
+            dst_rel = Path("extra") / src_ets.name
+        else:
+            src_ets = resolve_path(ets_entry["src"], spec_dir)
+            dst_rel = Path(ets_entry.get("dest", f"extra/{src_ets.name}"))
+        dst_ets = stage_dir / "entry/src/main/ets" / dst_rel
+        write_bytes_if_changed(dst_ets, src_ets.read_bytes())
+
+    entry_ability_text = (TEMPLATE_HOST_DIR / "entry/src/main/ets/entryability/EntryAbility.ets").read_text(
+        encoding="utf-8"
+    )
+    extra_imports = "\n".join(spec.get("abilityImports", []))
+    extra_plugins = ",\n    ".join(spec.get("abilityPlugins", []))
+    on_create_code = "\n    ".join(spec.get("abilityOnCreate", []))
+    entry_ability_text = entry_ability_text.replace("// __GPUI_EXTRA_IMPORTS__", extra_imports)
+    entry_ability_text = entry_ability_text.replace("// __GPUI_EXTRA_PLUGINS__", extra_plugins)
+    entry_ability_text = entry_ability_text.replace("// __GPUI_ON_CREATE__", on_create_code)
+    write_if_changed(
+        stage_dir / "entry/src/main/ets/entryability/EntryAbility.ets", entry_ability_text
+    )
+
+    app_json = {
+        "app": {
+            "bundleName": spec["bundleName"],
+            "vendor": spec.get("vendor", "gpui-ohos"),
+            "versionCode": int(spec.get("versionCode", 1)),
+            "versionName": str(spec.get("versionName", "0.1.0")),
+            "icon": "$media:app_icon",
+            "label": "$string:app_name",
+        }
+    }
+    app_strings = {"string": [{"name": "app_name", "value": spec["appName"]}]}
+
+    ability_entry: dict[str, Any] = {
+        "name": "EntryAbility",
+        "srcEntry": "./ets/entryability/EntryAbility.ets",
+        "icon": "$media:app_icon",
+        "label": "$string:app_name",
+        "startWindowIcon": "$media:app_icon",
+        "startWindowBackground": "$color:start_window_background",
+        "exported": True,
+        "skills": spec.get(
+            "skills",
+            [
+                {
+                    "entities": ["entity.system.home"],
+                    "actions": ["ohos.want.action.home"],
+                }
+            ],
+        ),
+    }
+
+    window_cfg = spec.get("window", {})
+    for wk in (
+        "minWindowWidth",
+        "minWindowHeight",
+        "maxWindowWidth",
+        "maxWindowHeight",
+        "defaultWindowWidth",
+        "defaultWindowHeight",
+        "supportWindowMode",
+    ):
+        if wk in window_cfg:
+            ability_entry[wk] = window_cfg[wk]
+
+    ability_meta: list[dict[str, str]] = list(spec.get("abilityMetadata", []))
+    if spec.get("isMaximize") and not any(
+        m.get("name") == "ohos.ability.window.isMaximize" for m in ability_meta
+    ):
+        ability_meta.append({"name": "ohos.ability.window.isMaximize", "value": "true"})
+    if ability_meta:
+        ability_entry["metadata"] = ability_meta
+
+    module_body: dict[str, Any] = {
+        "name": "entry",
+        "type": "entry",
+        "mainElement": "EntryAbility",
+        "deviceTypes": spec.get("deviceTypes", ["2in1", "tablet"]),
+        "deliveryWithInstall": True,
+        "installationFree": False,
+        "compressNativeLibs": bool(spec.get("compressNativeLibs", True)),
+        "pages": "$profile:main_pages",
+        "abilities": [ability_entry],
+        "requestPermissions": spec.get("permissions", []),
+    }
+    if module_meta := spec.get("moduleMetadata"):
+        module_body["metadata"] = module_meta
+    if hnp_items:
+        module_body["hnpPackages"] = [
+            {"package": p.name, "type": htype} for p, htype in hnp_items
+        ]
+
+    write_if_changed(
+        stage_dir / "AppScope/app.json5",
+        json.dumps(app_json, indent=2, ensure_ascii=False) + "\n",
+    )
+    write_if_changed(
+        stage_dir / "AppScope/resources/base/element/string.json",
+        json.dumps(app_strings, indent=2, ensure_ascii=False) + "\n",
+    )
+    write_if_changed(
+        stage_dir / "entry/src/main/module.json5",
+        json.dumps({"module": module_body}, indent=2, ensure_ascii=False) + "\n",
+    )
+
+    # Copy rawfiles / resfiles if configured
+    for key, subdir in (("rawfiles", "rawfile"), ("resfiles", "resfile")):
+        for entry in spec.get(key, []):
+            if isinstance(entry, str):
+                src = resolve_path(entry, spec_dir)
+                dest_rel = src.name
+            else:
+                src = resolve_path(entry["src"], spec_dir)
+                dest_rel = entry.get("dest", src.name)
+            dst = stage_dir / "entry/src/main/resources" / subdir / dest_rel
+            if src.is_dir():
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+            else:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+
+
+def compute_stage_shell_hash(stage_dir: Path) -> str:
+    hasher = hashlib.sha256()
+    tracked_roots = [
+        stage_dir / "build-profile.json5",
+        stage_dir / "hvigorfile.ts",
+        stage_dir / "oh-package.json5",
+        stage_dir / "hvigor/hvigor-config.json5",
+        stage_dir / "AppScope",
+        stage_dir / "entry/build-profile.json5",
+        stage_dir / "entry/hvigorfile.ts",
+        stage_dir / "entry/oh-package.json5",
+        stage_dir / "entry/src",
+    ]
+    files: list[Path] = []
+    for item in tracked_roots:
+        if item.is_file():
+            files.append(item)
+        elif item.is_dir():
+            files.extend(sorted(p for p in item.rglob("*") if p.is_file()))
+    for f in sorted(files):
+        rel = f.relative_to(stage_dir).as_posix()
+        hasher.update(rel.encode("utf-8"))
+        hasher.update(b"\0")
+        hasher.update(f.read_bytes())
+        hasher.update(b"\0")
+    return hasher.hexdigest()[:16]
+
+
+def cargo_ohos_env(tc: Toolchains, target_dir: Path | None = None) -> dict[str, str]:
+    llvm_bin = tc.ohos_sdk / "native/llvm/bin"
+    libclang_candidates = [
+        tc.clt_root / "sdk/default/openharmony/native/llvm/lib" if tc.clt_root else None,
+        tc.ohos_sdk / "native/llvm/lib",
+    ]
+    libclang_dir = next((p for p in libclang_candidates if p and p.is_dir()), llvm_bin.parent / "lib")
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "OHOS_SDK_ROOT": str(tc.ohos_sdk),
+            "OHOS_NDK_HOME": str(tc.ohos_sdk),
+            "OHOS_DEVICE_TYPE": "desktop",
+            "CC_aarch64_unknown_linux_ohos": str(llvm_bin / "clang"),
+            "CXX_aarch64_unknown_linux_ohos": str(llvm_bin / "clang++"),
+            "AR_aarch64_unknown_linux_ohos": str(llvm_bin / "llvm-ar"),
+            "RANLIB_aarch64_unknown_linux_ohos": str(llvm_bin / "llvm-ranlib"),
+            "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_OHOS_LINKER": str(llvm_bin / "clang"),
+            "LIBCLANG_PATH": str(libclang_dir),
+            "BINDGEN_EXTRA_CLANG_ARGS": f"--sysroot={tc.ohos_sdk / 'native/sysroot'} --target=aarch64-linux-ohos",
+            "TMPDIR": str(tc.safe_tmpdir),
+        }
+    )
+    if target_dir is not None:
+        env["CARGO_TARGET_DIR"] = str(target_dir)
+    return env
+
+
+def build_rust_targets(
+    spec: dict[str, Any],
+    spec_dir: Path,
+    tc: Toolchains,
+    profile: str,
+    extra_features: list[str],
+) -> tuple[Path, list[tuple[Path, str]], Path]:
+    manifest_path = resolve_path(spec["manifestPath"], spec_dir)
+    target_dir = (
+        resolve_path(spec["targetDir"], spec_dir)
+        if spec.get("targetDir")
+        else (manifest_path.parent / "target").resolve()
+    )
+    env = cargo_ohos_env(tc, target_dir)
+
+    def _build_one(pkg_name: str | None, features: list[str], so_name: str) -> Path:
+        cmd = [
+            tc.cargo_bin,
+            "build",
+            "--manifest-path",
+            str(manifest_path),
+            "--target",
+            "aarch64-unknown-linux-ohos",
+        ]
+        if pkg_name:
+            cmd.extend(["-p", pkg_name])
+        if profile == "release":
+            cmd.append("--release")
+        if features:
+            cmd.extend(["--features", ",".join(features)])
+        t0 = time.monotonic()
+        run_cmd(cmd, cwd=manifest_path.parent, env=env)
+        out_so = target_dir / "aarch64-unknown-linux-ohos" / profile / so_name
+        if not out_so.is_file():
+            raise FileNotFoundError(f"Expected cdylib not found: {out_so}")
+        print(
+            f"[ok] Built {out_so.name} ({out_so.stat().st_size / 1048576:.1f} MiB) in {time.monotonic() - t0:.1f}s",
+            flush=True,
+        )
+        return out_so
+
+    primary_features = list(spec.get("features", [])) + [f for f in extra_features if f]
+    primary_so_name = spec.get("soName", "libgpui_app.so")
+    primary_so = _build_one(spec.get("package"), primary_features, primary_so_name)
+
+    extra_built: list[tuple[Path, str]] = []
+    for extra in spec.get("extraCargoTargets", []):
+        ext_so_name = extra["soName"]
+        ext_dest_name = extra.get("destName", ext_so_name)
+        ext_so = _build_one(extra.get("package"), list(extra.get("features", [])), ext_so_name)
+        extra_built.append((ext_so, ext_dest_name))
+
+    return primary_so, extra_built, target_dir
+
+
+def repack_payloads_into_hap(
+    template_hap: Path,
+    libs_dir: Path,
+    hnp_items: list[tuple[Path, str]],
+    out_unsigned_hap: Path,
+) -> None:
+    out_unsigned_hap.parent.mkdir(parents=True, exist_ok=True)
+    tmp_hap = out_unsigned_hap.with_suffix(".tmp.hap")
+    replacement_libs = {
+        f"libs/arm64-v8a/{p.name}": p for p in sorted(libs_dir.glob("*.so"))
+    }
+    replacement_hnps = {
+        f"hnp/arm64-v8a/{p.name}": p for p, _ in hnp_items
+    }
+    with zipfile.ZipFile(template_hap, "r") as zin, zipfile.ZipFile(
+        tmp_hap, "w", compression=zipfile.ZIP_DEFLATED
+    ) as zout:
+        for item in zin.infolist():
+            if item.filename.startswith("libs/arm64-v8a/") and item.filename.endswith(".so"):
+                continue
+            if item.filename.startswith("hnp/arm64-v8a/") and item.filename.endswith(".hnp"):
+                continue
+            zout.writestr(item, zin.read(item.filename))
+        for arcname, src_path in replacement_libs.items():
+            zout.write(src_path, arcname, compress_type=zipfile.ZIP_DEFLATED)
+        for arcname, src_path in replacement_hnps.items():
+            # HNP archives are already compressed; store directly for sub-second repacking.
+            zout.write(src_path, arcname, compress_type=zipfile.ZIP_STORED)
+    tmp_hap.replace(out_unsigned_hap)
+
+
+def find_libcxx_shared(tc: Toolchains) -> Path:
+    candidates = [
+        tc.clt_root / "sdk/default/openharmony/native/llvm/lib/aarch64-linux-ohos/libc++_shared.so"
+        if tc.clt_root
+        else None,
+        tc.ohos_sdk / "native/llvm/lib/aarch64-linux-ohos/libc++_shared.so",
+    ]
+    found = next((p for p in candidates if p and p.is_file()), None)
+    if found is None:
+        raise FileNotFoundError("Could not locate aarch64-linux-ohos/libc++_shared.so in OHOS SDK")
+    return found
+
+
+def assemble_unsigned_hap(
+    spec: dict[str, Any],
+    spec_dir: Path,
+    tc: Toolchains,
+    cache_dir: Path,
+    primary_so: Path,
+    extra_built: list[tuple[Path, str]],
+    hnp_items: list[tuple[Path, str]],
+    out_dir: Path,
+    force_hvigor: bool = False,
+) -> Path:
+    stage_dir = cache_dir / "stage"
+    prepare_stage_metadata(spec, spec_dir, tc, cache_dir, stage_dir, hnp_items)
+
+    libs_dir = stage_dir / "entry/libs/arm64-v8a"
+    if libs_dir.exists():
+        shutil.rmtree(libs_dir)
+    libs_dir.mkdir(parents=True, exist_ok=True)
+
+    # EntryAbility loads `libgpui_app.so`
+    shutil.copy2(primary_so, libs_dir / "libgpui_app.so")
+    shutil.copy2(find_libcxx_shared(tc), libs_dir / "libc++_shared.so")
+
+    for ext_so, dest_name in extra_built:
+        shutil.copy2(ext_so, libs_dir / dest_name)
+
+    for raw_lib in spec.get("extraLibs", []):
+        if isinstance(raw_lib, str):
+            src_lib = resolve_path(raw_lib, spec_dir)
+            dest_name = src_lib.name
+        else:
+            src_lib = resolve_path(raw_lib["src"], spec_dir)
+            dest_name = raw_lib.get("destName", src_lib.name)
+        shutil.copy2(src_lib, libs_dir / dest_name)
+
+    if hnp_items:
+        hnp_dir = stage_dir / "entry/hnp/arm64-v8a"
+        hnp_dir.mkdir(parents=True, exist_ok=True)
+        for hnp_path, _ in hnp_items:
+            shutil.copy2(hnp_path, hnp_dir / hnp_path.name)
+
+    shell_hash = compute_stage_shell_hash(stage_dir)
+    cached_shell_hap = cache_dir / "shells" / f"shell-{shell_hash}-unsigned.hap"
+    out_unsigned_hap = out_dir / f"{spec['name']}-unsigned.hap"
+
+    if cached_shell_hap.is_file() and not force_hvigor:
+        t0 = time.monotonic()
+        repack_payloads_into_hap(cached_shell_hap, libs_dir, hnp_items, out_unsigned_hap)
+        print(
+            f"[ok] Repacked unsigned HAP from cache ({shell_hash}) in {time.monotonic() - t0:.2f}s -> {out_unsigned_hap}",
+            flush=True,
+        )
+        return out_unsigned_hap
+
+    if tc.clt_root is None:
+        raise RuntimeError(
+            "No cached shell HAP found and HMOS Command Line Tools (hvigorw/ohpm) were not discovered. "
+            "Set HMOS_CLT_ROOT or DEVECO_SDK_HOME."
+        )
+
+    clt_env = os.environ.copy()
+    clt_env["DEVECO_SDK_HOME"] = str(tc.clt_root / "sdk")
+    clt_env["TMPDIR"] = str(tc.safe_tmpdir)
+    clt_env["PATH"] = (
+        f"{tc.clt_root / 'node/bin'}:{tc.clt_root / 'ohpm/bin'}:{tc.clt_root / 'hvigor/bin'}:"
+        f"{clt_env.get('PATH', '')}"
+    )
+
+    if not (stage_dir / "entry/oh_modules").is_dir():
+        run_cmd([str(tc.clt_root / "ohpm/bin/ohpm"), "install", "--all"], cwd=stage_dir, env=clt_env)
+
+    t0 = time.monotonic()
+    run_cmd(
+        [
+            str(tc.clt_root / "hvigor/bin/hvigorw"),
+            "assembleHap",
+            "--mode",
+            "module",
+            "-p",
+            "product=default",
+            "--no-daemon",
+        ],
+        cwd=stage_dir,
+        env=clt_env,
+    )
+    hvigor_out = stage_dir / "entry/build/default/outputs/default/entry-default-unsigned.hap"
+    if not hvigor_out.is_file():
+        raise FileNotFoundError(f"hvigorw did not produce {hvigor_out}")
+
+    cached_shell_hap.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(hvigor_out, cached_shell_hap)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # Repack so HNP payloads use ZIP_STORED consistently
+    repack_payloads_into_hap(cached_shell_hap, libs_dir, hnp_items, out_unsigned_hap)
+    print(
+        f"[ok] Assembled & cached unsigned HAP ({shell_hash}) in {time.monotonic() - t0:.1f}s -> {out_unsigned_hap}",
+        flush=True,
+    )
+    return out_unsigned_hap
+
+
+def sign_hap(spec: dict[str, Any], tc: Toolchains, unsigned_hap: Path) -> Path:
+    if tc.hda_bin is None:
+        raise FileNotFoundError("Could not locate `hda` signer binary. Set HDA_BIN.")
+
+    signed_hap = unsigned_hap.with_name(f"{spec['name']}-signed.hap")
+    base_acls: list[str] = list(spec.get("acls", []))
+    optional_acls: list[str] = list(spec.get("optionalAcls", []))
+
+    def _try_sign(acls: list[str]) -> subprocess.CompletedProcess[str]:
+        signed_hap.unlink(missing_ok=True)
+        cmd = [str(tc.hda_bin), "install", str(unsigned_hap)]
+        for acl in acls:
+            cmd.extend(["--acl", acl])
+        cmd.extend(["--keep-signed", str(signed_hap)])
+        env = os.environ.copy()
+        env["TMPDIR"] = str(tc.safe_tmpdir)
+        return subprocess.run(cmd, capture_output=True, text=True, env=env)
+
+    t0 = time.monotonic()
+    combined_acls = base_acls + [a for a in optional_acls if a not in base_acls]
+    res = _try_sign(combined_acls)
+    if not signed_hap.is_file() and optional_acls:
+        print(
+            f"[warn] Signing with optionalAcls {optional_acls} was rejected by current profile; "
+            f"retrying with base ACLs {base_acls}...",
+            file=sys.stderr,
+            flush=True,
+        )
+        res = _try_sign(base_acls)
+
+    if res.stdout:
+        print(res.stdout, end="")
+    if res.stderr:
+        print(res.stderr, end="", file=sys.stderr)
+    if not signed_hap.is_file():
+        raise RuntimeError(f"hda failed to produce signed HAP {signed_hap} (exit {res.returncode})")
+
+    print(
+        f"[ok] Signed HAP ({signed_hap.stat().st_size / 1048576:.1f} MiB) in {time.monotonic() - t0:.1f}s -> {signed_hap}",
+        flush=True,
+    )
+    return signed_hap
+
+
+def install_and_launch_hdc(spec: dict[str, Any], tc: Toolchains, signed_hap: Path, launch: bool = True) -> None:
+    if not tc.hdc_bin:
+        raise FileNotFoundError("Could not locate `hdc`. Set HDC_BIN or use --no-install.")
+
+    target = os.environ.get("HDC_TARGET")
+    if not target:
+        param_bin = Path("/system/bin/param")
+        if param_bin.is_file():
+            port = subprocess.check_output(
+                [str(param_bin), "get", "persist.hdc.port"], text=True
+            ).strip()
+            if not port or not port.isdigit():
+                raise RuntimeError(
+                    f"persist.hdc.port invalid ({port!r}); enable Wireless Debugging in Developer Options"
+                )
+            target = f"127.0.0.1:{port}"
+
+    env = os.environ.copy()
+    env["TMPDIR"] = str(tc.safe_tmpdir)
+
+    t_args = ["-t", target] if target else []
+    if target:
+        subprocess.run([tc.hdc_bin, "tconn", target], cwd=tc.safe_tmpdir, env=env, check=False)
+
+    bundle = spec["bundleName"]
+    subprocess.run(
+        [tc.hdc_bin, *t_args, "shell", f"aa force-stop {bundle}"],
+        cwd=tc.safe_tmpdir,
+        env=env,
+        check=False,
+    )
+    run_cmd([tc.hdc_bin, *t_args, "install", "-r", str(signed_hap)], cwd=tc.safe_tmpdir, env=env)
+    if launch:
+        run_cmd(
+            [tc.hdc_bin, *t_args, "shell", f"aa start -b {bundle} -a EntryAbility"],
+            cwd=tc.safe_tmpdir,
+            env=env,
+        )
+
+
+def print_doctor(tc: Toolchains) -> None:
+    print("gpui-ohos-pack toolchain status:")
+    print(f"  ohos_sdk      : {tc.ohos_sdk}")
+    print(f"  clt_root      : {tc.clt_root or '(not found)'}")
+    print(f"  cargo         : {tc.cargo_bin}")
+    print(f"  hda           : {tc.hda_bin or '(not found)'}")
+    print(f"  hdc           : {tc.hdc_bin or '(not found)'}")
+    print(f"  hnpcli        : {tc.hnpcli_bin or '(not found)'}")
+    print(f"  binary-sign   : {tc.sign_tool_bin or '(not found)'}")
+    print(f"  safe_tmpdir   : {tc.safe_tmpdir}")
+    print(f"  cache_dir     : {default_cache_dir()}")
+
+
+def main() -> None:
+    if len(sys.argv) >= 2 and sys.argv[1] == "--doctor":
+        print_doctor(discover_toolchains())
+        return
+
+    if len(sys.argv) >= 2 and sys.argv[1] == "--cargo":
+        tc = discover_toolchains()
+        cargo_args = list(sys.argv[2:])
+        if cargo_args and cargo_args[0] == "--":
+            cargo_args = cargo_args[1:]
+        if not cargo_args:
+            raise SystemExit("Usage: gpui-ohos-pack --cargo <cargo-subcommand> [args...]")
+        subcmd = cargo_args[0]
+        if (
+            subcmd in {"check", "build", "clippy", "test", "rustc"}
+            and "--target" not in cargo_args
+            and not any(a.startswith("--target=") for a in cargo_args)
+        ):
+            cargo_args = [subcmd, "--target", "aarch64-unknown-linux-ohos", *cargo_args[1:]]
+        run_cmd([tc.cargo_bin, *cargo_args], env=cargo_ohos_env(tc))
+        return
+
+    parser = argparse.ArgumentParser(
+        description="Universal HarmonyOS PC HAP builder, signer & installer for GPUI applications"
+    )
+    parser.add_argument(
+        "app",
+        nargs="?",
+        default=".",
+        help="Path to app directory, ohos-app.json, or Cargo.toml (default: current directory)",
+    )
+    parser.add_argument("--doctor", action="store_true", help="Print auto-discovered OHOS toolchains")
+    parser.add_argument(
+        "--cargo",
+        nargs=argparse.REMAINDER,
+        help="Run cargo with auto-configured aarch64-unknown-linux-ohos NDK environment",
+    )
+    parser.add_argument("--profile", choices=["release", "debug"], default="release")
+    parser.add_argument("--features", default="", help="Comma-separated extra Cargo features")
+    parser.add_argument("--out-dir", default="", help="Output directory for unsigned/signed HAPs")
+    parser.add_argument("--cache-dir", default="", help="Override packager cache directory")
+    parser.add_argument("--force-hvigor", action="store_true", help="Rebuild ArkTS host even if cached")
+    parser.add_argument("--force-hnp", action="store_true", help="Rebuild declared HNP packages")
+    parser.add_argument("--no-sign", action="store_true", help="Build unsigned HAP only")
+    parser.add_argument("--no-install", action="store_true", help="Build & sign only; skip hdc install")
+    parser.add_argument("--no-launch", action="store_true", help="Install HAP without launching EntryAbility")
+    args = parser.parse_args()
+
+    tc = discover_toolchains()
+    spec, spec_dir = load_app_spec(args.app)
+    cache_dir = Path(args.cache_dir).expanduser().resolve() if args.cache_dir else default_cache_dir()
+
+    extra_features = [f.strip() for f in args.features.split(",") if f.strip()]
+    primary_so, extra_built, target_dir = build_rust_targets(
+        spec, spec_dir, tc, args.profile, extra_features
+    )
+    hnp_items = resolve_hnp_packages(spec, spec_dir, tc, force_hnp=args.force_hnp)
+
+    out_dir = (
+        resolve_path(args.out_dir, Path.cwd())
+        if args.out_dir
+        else (
+            resolve_path(spec["outDir"], spec_dir)
+            if spec.get("outDir")
+            else (target_dir / "ohos-hap" / spec["name"]).resolve()
+        )
+    )
+
+    unsigned_hap = assemble_unsigned_hap(
+        spec=spec,
+        spec_dir=spec_dir,
+        tc=tc,
+        cache_dir=cache_dir,
+        primary_so=primary_so,
+        extra_built=extra_built,
+        hnp_items=hnp_items,
+        out_dir=out_dir,
+        force_hvigor=args.force_hvigor,
+    )
+
+    if args.no_sign:
+        return
+
+    signed_hap = sign_hap(spec, tc, unsigned_hap)
+    if not args.no_install:
+        install_and_launch_hdc(spec, tc, signed_hap, launch=not args.no_launch)
+
+
+if __name__ == "__main__":
+    main()

@@ -26,8 +26,8 @@ use openharmony_ability_plugin_files::{
 use openharmony_ability_plugin_menu as menu_plugin;
 
 use menu_plugin::{
-    MenuBridgePlugin, MenuClient, MenuItemData, MenuSetMenubarRequest, register_menu_event_sender,
-    register_menu_open_event_sender,
+    MenuBridgePlugin, MenuClient, MenuItemData, MenuSetMenubarRequest, MenuSetVisibleRequest,
+    register_menu_event_sender, register_menu_open_event_sender,
 };
 use openharmony_ability_plugin_notification as notification_plugin;
 
@@ -396,6 +396,7 @@ impl OhosPlatform {
     }
 
     pub(crate) fn new(app: OpenHarmonyApp, options: super::PlatformOptions) -> Result<Self> {
+        let _ = super::seccomp_guard::install_seccomp_sigsys_guard();
         let (main_sender, main_receiver) = PriorityQueueReceiver::new();
         let dispatcher = Arc::new(OhosDispatcher::new(main_sender));
         let background_executor = BackgroundExecutor::new(dispatcher.clone());
@@ -735,17 +736,31 @@ impl OhosPlatform {
                     return;
                 }
             };
+        let menubar_visible = self
+            .window_index
+            .borrow()
+            .get(&window_id)
+            .and_then(Weak::upgrade)
+            .is_none_or(|window| !window.borrow().uses_client_decorations());
+        let window_key = if window_id == 0 {
+            "main".to_string()
+        } else {
+            window_id.to_string()
+        };
         self.background_executor
             .spawn(async move {
                 let result = async {
-                    MenuClient::new(&app)?
+                    let client = MenuClient::new(&app)?;
+                    client
                         .set_menubar(MenuSetMenubarRequest {
                             json_data,
-                            window_id: if window_id == 0 {
-                                "main".into()
-                            } else {
-                                window_id.to_string()
-                            },
+                            window_id: window_key.clone(),
+                        })
+                        .await?;
+                    client
+                        .set_menubar_visible(MenuSetVisibleRequest {
+                            window_id: window_key,
+                            visible: menubar_visible,
                         })
                         .await
                 }

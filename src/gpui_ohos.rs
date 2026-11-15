@@ -10,7 +10,13 @@ extern crate gpui_fast as gpui;
 mod ohos;
 
 pub use gpui::*;
-pub use ohos::{PlatformOptions, current_platform, try_current_platform};
+pub use ohos::{
+    OhosApplication, PlatformOptions, application, current_platform,
+    desktop_platform as platform, install_seccomp_sigsys_guard,
+    is_seccomp_sigsys_guard_installed, registered_current_platform, registered_openharmony_app,
+    retain_application_handle, set_openharmony_app, try_current_platform,
+    unblock_sigsys_current_thread,
+};
 
 pub use ohos::{
     FontCatalog, FontDesignCoordinate, FontFaceData, PlatformServices, SyntheticFontStyle,

@@ -1,3 +1,7 @@
 target/
 .DS_Store
 dist/
+__pycache__/
+oh_modules/
+.hvigor/
+oh-package-lock.json5

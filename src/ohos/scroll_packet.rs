@@ -1,4 +1,4 @@
-use gpui::{Point, ScrollDelta, TouchPhase, px};
+use gpui::{Point, ScrollDelta, px};
 
 #[cfg(feature = "native-input")]
 use super::scroll_input::{NativeScrollDelta, NativeScrollScope};
@@ -13,19 +13,15 @@ pub(super) struct ScrollPacket {
 
 impl ScrollPacket {
     pub(super) fn axis(raw: Point<f64>, scale: f32, wheel: bool, scroll_step: i32) -> Option<Self> {
+        // OH_ArkUI_AxisEvent reports viewport scroll offset (positive = scroll down/right,
+        // with system natural-scrolling preference already applied), whereas GPUI ScrollDelta
+        // represents content displacement (negative = scroll down/right, matching Wayland -1.0).
+        let raw = gpui::point(-raw.x, -raw.y);
         if wheel {
             Self::wheel(raw, scroll_step)
         } else {
             Self::pixels(raw, scale)
         }
-    }
-
-    pub(super) fn should_dispatch(&self, phase: TouchPhase) -> bool {
-        let nonzero = match self.delta {
-            ScrollDelta::Lines(delta) => delta.x != 0. || delta.y != 0.,
-            ScrollDelta::Pixels(delta) => delta.x != px(0.) || delta.y != px(0.),
-        };
-        nonzero || matches!(phase, TouchPhase::Started | TouchPhase::Ended)
     }
 
     /// Keep the system scroll-step coefficient in ordinary widget line deltas.

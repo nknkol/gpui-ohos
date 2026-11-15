@@ -26,13 +26,16 @@ use openharmony_ability::{
         TouchEvent as OhosTouchEvent, TouchEventData, TouchPointData, TouchPointTool,
     },
 };
-use openharmony_ability_plugin_menu::{MenuClient, MenuCommandItem, MenuPopupCommandsRequest};
+use openharmony_ability_plugin_menu::{
+    MenuClient, MenuCommandItem, MenuPopupCommandsRequest, MenuSetVisibleRequest,
+};
 use openharmony_ability_plugin_window::{
     WindowClient, WindowCloseSubscription, WindowMoveSubscription, on_window_close_requested,
 };
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use rustc_hash::FxHashMap;
 
+use super::axis_scroll::AxisScroll;
 use super::display::OhosDisplay;
 use super::frame_delivery::WindowFrames;
 use super::keyboard::OhosKeyState;
@@ -49,7 +52,7 @@ use crate::{
     Modifiers, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent,
     NavigationDirection, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
     PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
-    ResizeEdge, Scene, ScrollDelta, ScrollEvent, ScrollSource, Size, Task, TextInputAction,
+    ResizeEdge, Scene, ScrollDelta, Size, Task, TextInputAction,
     TextInputConfiguration, TextInputStateChange, TouchEvent, TouchId, TouchPhase,
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls,
     WindowDecorations, WindowInsets, WindowParams, WindowVisibility, accesskit, point, px, size,
@@ -174,6 +177,7 @@ pub(crate) struct OhosWindow {
     touch_tap_candidates: RefCell<HashMap<i32, TouchTapCandidate>>,
     next_touch_id: Cell<u64>,
     touch_scroll: Rc<RefCell<TouchScroll>>,
+    axis_scroll: RefCell<AxisScroll>,
     long_press_timer: RefCell<Option<(TouchId, Task<()>)>>,
 }
 
@@ -804,6 +808,7 @@ impl OhosWindow {
             touch_tap_candidates: RefCell::new(HashMap::new()),
             next_touch_id: Cell::new(0),
             touch_scroll: Rc::new(RefCell::new(TouchScroll::default())),
+            axis_scroll: RefCell::new(AxisScroll::default()),
             long_press_timer: RefCell::new(None),
         })
     }
@@ -879,6 +884,10 @@ impl OhosWindow {
         if let Some(input) = momentum_input {
             self.dispatch_input(input);
         }
+        let axis_momentum_input = self.axis_scroll.borrow_mut().tick(frame_time);
+        if let Some(input) = axis_momentum_input {
+            self.dispatch_input(input);
+        }
         let mut callback = self.callbacks.borrow_mut().request_frame.take();
         if let Some(ref mut callback) = callback {
             callback(RequestFrameOptions {
@@ -892,6 +901,10 @@ impl OhosWindow {
         }
         self.callbacks.borrow_mut().request_frame = callback;
         self.request_touch_momentum_frame();
+    }
+
+    pub(crate) fn uses_client_decorations(&self) -> bool {
+        self.requested_decorations.get() == WindowDecorations::Client && self.has_window_controls()
     }
 
     pub(crate) fn has_window_controls(&self) -> bool {
@@ -1179,7 +1192,7 @@ impl OhosWindow {
     }
 
     fn request_touch_momentum_frame(&self) {
-        if self.touch_scroll.borrow().has_momentum() {
+        if self.touch_scroll.borrow().has_momentum() || self.axis_scroll.borrow().has_momentum() {
             self.frames.request();
         }
     }
@@ -1215,6 +1228,9 @@ impl OhosWindow {
     fn cancel_touch_input(&self) {
         self.long_press_timer.borrow_mut().take();
         self.touch_scroll
+            .borrow_mut()
+            .cancel(|input| self.dispatch_input(input));
+        self.axis_scroll
             .borrow_mut()
             .cancel(|input| self.dispatch_input(input));
         self.active_touches.borrow_mut().clear();
@@ -1320,24 +1336,6 @@ impl OhosWindow {
             }
             OhosTouchEvent::Unknown => {}
         }
-    }
-
-    fn dispatch_scroll(
-        &self,
-        position: Point<Pixels>,
-        delta: ScrollDelta,
-        touch_phase: TouchPhase,
-    ) -> crate::DispatchEventResult {
-        Self::dispatch_input_with_callbacks(
-            &self.callbacks,
-            PlatformInput::Scroll(ScrollEvent {
-                position,
-                delta,
-                modifiers: self.key_state.borrow().modifiers(),
-                touch_phase,
-                source: ScrollSource::Pointer,
-            }),
-        )
     }
 
     fn mouse_button(button: OhosMouseButton) -> Option<MouseButton> {
@@ -3107,6 +3105,9 @@ impl OhosWindow {
                 let event_button = Self::mouse_button(mouse_event.button);
                 match mouse_event.action {
                     MouseAction::Press => {
+                        self.axis_scroll
+                            .borrow_mut()
+                            .cancel(|input| self.dispatch_input(input));
                         self.invalidate_pending_edit();
                         let Some(button) = event_button else {
                             return;
@@ -3242,22 +3243,57 @@ impl OhosWindow {
                 self.pointer_position.set(Some(position));
                 let raw = point(axis_event.delta_x, axis_event.delta_y);
                 let scale = *self.scale.borrow();
-                let wheel = axis_event.pointer.source_type == UIInputSourceType::Mouse
-                    && axis_event.pointer.tool_type != UIInputToolType::Touchpad;
+                let is_touchpad = matches!(
+                    axis_event.pointer.tool_type,
+                    UIInputToolType::Touchpad | UIInputToolType::Finger
+                ) || (axis_event.pointer.tool_type != UIInputToolType::Mouse
+                    && axis_event.scroll_step == 0);
+                let wheel = !is_touchpad
+                    && axis_event.pointer.source_type == UIInputSourceType::Mouse;
                 let packet = ScrollPacket::axis(raw, scale, wheel, axis_event.scroll_step);
                 let Some(packet) = packet else {
                     return;
                 };
                 let touch_phase = match axis_event.pointer.action {
                     UIInputAction::Down => TouchPhase::Started,
-                    UIInputAction::Up | UIInputAction::Cancel => TouchPhase::Ended,
+                    UIInputAction::Up => TouchPhase::Ended,
+                    UIInputAction::Cancel => TouchPhase::Cancelled,
                     UIInputAction::Move => TouchPhase::Moved,
                 };
-                if packet.should_dispatch(touch_phase) {
-                    #[cfg(feature = "native-input")]
-                    let _native = packet.bind(self.handle.window_id(), scale);
-                    self.dispatch_scroll(position, packet.delta, touch_phase);
+                let modifiers = self.key_state.borrow().modifiers();
+                let now = Instant::now();
+                #[cfg(feature = "native-input")]
+                let _native = packet.bind(self.handle.window_id(), scale);
+                match packet.delta {
+                    ScrollDelta::Pixels(delta) => {
+                        self.touch_scroll
+                            .borrow_mut()
+                            .cancel(|input| self.dispatch_input(input));
+                        self.axis_scroll.borrow_mut().handle_touchpad(
+                            position,
+                            delta,
+                            touch_phase,
+                            modifiers,
+                            axis_event.pointer.timestamp,
+                            now,
+                            |input| self.dispatch_input(input),
+                        );
+                    }
+                    ScrollDelta::Lines(lines) => {
+                        self.touch_scroll
+                            .borrow_mut()
+                            .cancel(|input| self.dispatch_input(input));
+                        self.axis_scroll.borrow_mut().handle_wheel(
+                            position,
+                            lines,
+                            touch_phase,
+                            modifiers,
+                            now,
+                            |input| self.dispatch_input(input),
+                        );
+                    }
                 }
+                self.request_touch_momentum_frame();
             }
             InputEvent::ArkUi(ArkUiInputEvent::Gesture(
                 openharmony_ability::GestureEvent::Pan(pan),
@@ -3267,6 +3303,9 @@ impl OhosWindow {
                 {
                     return;
                 }
+                self.axis_scroll
+                    .borrow_mut()
+                    .cancel(|input| self.dispatch_input(input));
                 let phase = match pan.phase {
                     openharmony_ability::GesturePhase::Start => TouchPhase::Started,
                     openharmony_ability::GesturePhase::Update => TouchPhase::Moved,
@@ -4806,8 +4845,27 @@ impl PlatformWindow for OhosWindow {
         let window_id = self.window_id;
         let state = self.decorations.clone();
         let window_index = self.window_index.clone();
+        let menu_app = self.native_menus.then(|| self.app.borrow().clone()).flatten();
         self.foreground_executor
             .spawn(async move {
+                if let Some(app) = menu_app {
+                    let window_key = if window_id == 0 {
+                        "main".to_string()
+                    } else {
+                        window_id.to_string()
+                    };
+                    if let Ok(menu_client) = MenuClient::new(&app) {
+                        if let Err(error) = menu_client
+                            .set_menubar_visible(MenuSetVisibleRequest {
+                                window_id: window_key,
+                                visible: decorations == WindowDecorations::Server,
+                            })
+                            .await
+                        {
+                            warn!("Failed to update OHOS menubar visibility: {error}");
+                        }
+                    }
+                }
                 match client
                     .set_window_decorations(window_id, decorations == WindowDecorations::Server)
                     .await

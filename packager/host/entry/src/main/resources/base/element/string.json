@@ -1,0 +1,40 @@
+{
+  "string": [
+    {
+      "name": "clipboard_permission_reason",
+      "value": "用于读取与粘贴剪贴板中的文本、代码、图片与路径"
+    },
+    {
+      "name": "file_persist_permission_reason",
+      "value": "用于在应用重启后保留已授权工作区与文件的访问权限"
+    },
+    {
+      "name": "user_file_permission_reason",
+      "value": "用于读写用户已授权的工作区与项目目录"
+    },
+    {
+      "name": "full_disk_permission_reason",
+      "value": "用于访问并管理本地工作区与开发工程目录"
+    },
+    {
+      "name": "documents_dir_permission_reason",
+      "value": "用于访问与编辑文稿目录中的项目文件"
+    },
+    {
+      "name": "download_dir_permission_reason",
+      "value": "用于导入与保存下载目录中的文件"
+    },
+    {
+      "name": "desktop_dir_permission_reason",
+      "value": "用于访问与保存桌面目录中的文件"
+    },
+    {
+      "name": "skill_permission_reason",
+      "value": "用于发现与调用系统级 Skill 扩展能力"
+    },
+    {
+      "name": "sandbox_bundle_permission_reason",
+      "value": "用于管理受限 Agent 沙箱扩展包"
+    }
+  ]
+}
