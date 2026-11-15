@@ -187,9 +187,19 @@ def discover_toolchains() -> Toolchains:
 def default_cache_dir() -> Path:
     if env_cache := os.environ.get("GPUI_OHOS_CACHE_DIR"):
         return Path(env_cache).expanduser().resolve()
+    ohos_user_root = Path("/storage/Users/currentUser")
     xdg = os.environ.get("XDG_CACHE_HOME")
-    base = Path(xdg).expanduser() if xdg else (Path.home() / ".cache")
-    return (base / "gpui-ohos-packager").resolve()
+    if xdg:
+        xdg_path = Path(xdg).expanduser().resolve()
+        # On HarmonyOS PC, hvigor-arkts-compose `checkFileWithCase` hardcodes
+        # `getRootDir() == "/storage/Users/currentUser"` when resolving local `.ets`
+        # imports; staging under `/data/storage/el2/...` walks past `base` into `0711`
+        # `/data/storage/el2` and fails with `EACCES: scandir '/data/storage/el2'`.
+        if not ohos_user_root.is_dir() or xdg_path.is_relative_to(ohos_user_root):
+            return (xdg_path / "gpui-ohos-packager").resolve()
+    if ohos_user_root.is_dir():
+        return (ohos_user_root / ".cache" / "gpui-ohos-packager").resolve()
+    return (Path.home() / ".cache" / "gpui-ohos-packager").resolve()
 
 
 def resolve_path(raw: str | Path, base_dir: Path) -> Path:
@@ -754,20 +764,27 @@ def prepare_stage_metadata(
         + "\n",
     )
 
-    # Extra custom string resources if requested
+    # Extra custom string resources if requested (+ standard DevEco Stage defaults)
     base_strings = json.loads(
         (TEMPLATE_HOST_DIR / "entry/src/main/resources/base/element/string.json").read_text(
             encoding="utf-8"
         )
     )["string"]
     existing_names = {entry["name"] for entry in base_strings}
-    for k, v in spec.get("strings", {}).items():
+    default_stage_strings = {
+        "module_desc": f"{spec['appName']} module",
+        "EntryAbility_desc": f"{spec['appName']} desktop ability",
+        "EntryAbility_label": spec["appName"],
+    }
+    merged_strings = {**default_stage_strings, **spec.get("strings", {})}
+    for k, v in merged_strings.items():
         if k in existing_names:
             for entry in base_strings:
                 if entry["name"] == k:
                     entry["value"] = v
         else:
             base_strings.append({"name": k, "value": v})
+            existing_names.add(k)
     write_if_changed(
         stage_dir / "entry/src/main/resources/base/element/string.json",
         json.dumps({"string": base_strings}, indent=2, ensure_ascii=False) + "\n",
@@ -834,14 +851,27 @@ def prepare_stage_metadata(
         "minWindowHeight",
         "maxWindowWidth",
         "maxWindowHeight",
-        "defaultWindowWidth",
-        "defaultWindowHeight",
+        "minWindowRatio",
+        "maxWindowRatio",
         "supportWindowMode",
+        "preferMultiWindowOrientation",
     ):
         if wk in window_cfg:
             ability_entry[wk] = window_cfg[wk]
 
     ability_meta: list[dict[str, str]] = list(spec.get("abilityMetadata", []))
+    if "defaultWindowWidth" in window_cfg and not any(
+        m.get("name") == "ohos.ability.window.width" for m in ability_meta
+    ):
+        ability_meta.append(
+            {"name": "ohos.ability.window.width", "value": str(window_cfg["defaultWindowWidth"])}
+        )
+    if "defaultWindowHeight" in window_cfg and not any(
+        m.get("name") == "ohos.ability.window.height" for m in ability_meta
+    ):
+        ability_meta.append(
+            {"name": "ohos.ability.window.height", "value": str(window_cfg["defaultWindowHeight"])}
+        )
     if spec.get("isMaximize") and not any(
         m.get("name") == "ohos.ability.window.isMaximize" for m in ability_meta
     ):
@@ -1169,12 +1199,12 @@ def sign_hap(spec: dict[str, Any], tc: Toolchains, unsigned_hap: Path) -> Path:
     base_acls: list[str] = list(spec.get("acls", []))
     optional_acls: list[str] = list(spec.get("optionalAcls", []))
 
-    def _try_sign(acls: list[str]) -> subprocess.CompletedProcess[str]:
-        signed_hap.unlink(missing_ok=True)
+    def _try_sign(acls: list[str], out_path: Path) -> subprocess.CompletedProcess[str]:
+        out_path.unlink(missing_ok=True)
         cmd = [str(tc.hda_bin), "install", str(unsigned_hap)]
         for acl in acls:
             cmd.extend(["--acl", acl])
-        cmd.extend(["--keep-signed", str(signed_hap)])
+        cmd.extend(["--keep-signed", str(out_path)])
         env = os.environ.copy()
         env["TMPDIR"] = str(tc.safe_tmpdir)
         return subprocess.run(cmd, capture_output=True, text=True, env=env)
@@ -1182,7 +1212,7 @@ def sign_hap(spec: dict[str, Any], tc: Toolchains, unsigned_hap: Path) -> Path:
     t0 = time.monotonic()
     unique_opt = [a for a in optional_acls if a not in base_acls]
     combined_acls = base_acls + unique_opt
-    res = _try_sign(combined_acls)
+    res = _try_sign(combined_acls, signed_hap)
     if not signed_hap.is_file() and unique_opt:
         print(
             f"[warn] Signing with all optionalAcls {unique_opt} failed; probing supported subset...",
@@ -1190,30 +1220,31 @@ def sign_hap(spec: dict[str, Any], tc: Toolchains, unsigned_hap: Path) -> Path:
             flush=True,
         )
         accepted = list(base_acls)
-        last_good_res: subprocess.CompletedProcess[str] | None = None
-        base_res = _try_sign(accepted)
-        if signed_hap.is_file():
-            last_good_res = base_res
+        probe_hap = signed_hap.with_suffix(".probe.hap")
+        base_res = _try_sign(accepted, probe_hap)
+        if probe_hap.is_file():
+            shutil.move(str(probe_hap), str(signed_hap))
+            last_good_res: subprocess.CompletedProcess[str] = base_res
             kept_opt: list[str] = []
             rejected_opt: list[str] = []
             for opt_acl in unique_opt:
-                probe_res = _try_sign(accepted + [opt_acl])
-                if signed_hap.is_file():
+                probe_res = _try_sign(accepted + [opt_acl], probe_hap)
+                if probe_hap.is_file():
+                    shutil.move(str(probe_hap), str(signed_hap))
                     accepted.append(opt_acl)
                     kept_opt.append(opt_acl)
                     last_good_res = probe_res
                 else:
                     rejected_opt.append(opt_acl)
-            if not signed_hap.is_file() and last_good_res is not None:
-                res = _try_sign(accepted)
-            elif last_good_res is not None:
-                res = last_good_res
+            probe_hap.unlink(missing_ok=True)
+            res = last_good_res
             print(
                 f"[info] Retained optionalAcls={kept_opt}; skipped unsupported optionalAcls={rejected_opt}",
                 file=sys.stderr,
                 flush=True,
             )
         else:
+            probe_hap.unlink(missing_ok=True)
             res = base_res
 
     if res.stdout:
