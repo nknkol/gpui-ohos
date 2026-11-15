@@ -22,6 +22,8 @@ import hashlib
 import json
 import os
 import shutil
+import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -438,10 +440,259 @@ def sync_template_to_stage(stage_dir: Path) -> None:
             shutil.rmtree(extra_sub)
 
 
+def _elf_self_sign_bytes(data: bytes) -> bytes:
+    """Verify or inject an OpenHarmony 4KiB-aligned `.codesign` fs-verity self-sign section."""
+    page_size = 4096
+    desc_size = 256
+    sig_size = 32
+    shent_size = 64
+    if len(data) < 64 or data[:4] != b"\x7fELF" or data[4] != 2 or data[5] != 1:
+        return data
+    e_machine = struct.unpack_from("<H", data, 18)[0]
+    if e_machine != 183:  # EM_AARCH64
+        return data
+    e_shoff = struct.unpack_from("<Q", data, 0x28)[0]
+    e_shentsize = struct.unpack_from("<H", data, 0x3A)[0]
+    e_shnum = struct.unpack_from("<H", data, 0x3C)[0]
+    e_shstrndx = struct.unpack_from("<H", data, 0x3E)[0]
+    if e_shoff == 0 or e_shnum == 0 or e_shentsize != shent_size or e_shstrndx >= e_shnum:
+        return data
+    if e_shoff + e_shnum * shent_size > len(data):
+        return data
+
+    shstr_hdr = e_shoff + e_shstrndx * shent_size
+    shstr_off, shstr_size = struct.unpack_from("<QQ", data, shstr_hdr + 0x18)
+    if shstr_off + shstr_size > len(data):
+        return data
+
+    def _merkle_root(buf: bytes, cs_off: int) -> bytes:
+        page_count = (len(buf) + page_size - 1) // page_size
+        cs_page = cs_off // page_size
+        leaves = bytearray(page_count * sig_size)
+        for p in range(page_count):
+            if p == cs_page:
+                continue
+            chunk = buf[p * page_size : min(len(buf), (p + 1) * page_size)]
+            if len(chunk) < page_size:
+                chunk = chunk + b"\x00" * (page_size - len(chunk))
+            leaves[p * sig_size : (p + 1) * sig_size] = hashlib.sha256(chunk).digest()
+        if page_count == 1:
+            return bytes(leaves[:sig_size])
+        cur = bytes(leaves)
+        while len(cur) > page_size:
+            next_cnt = (len(cur) + page_size - 1) // page_size
+            nxt = bytearray(next_cnt * sig_size)
+            for p in range(next_cnt):
+                chunk = cur[p * page_size : min(len(cur), (p + 1) * page_size)]
+                if len(chunk) < page_size:
+                    chunk = chunk + b"\x00" * (page_size - len(chunk))
+                nxt[p * sig_size : (p + 1) * sig_size] = hashlib.sha256(chunk).digest()
+            cur = bytes(nxt)
+        root_page = cur + b"\x00" * (page_size - len(cur))
+        return hashlib.sha256(root_page).digest()
+
+    def _build_desc(sign_sz: int, file_sz: int, root: bytes) -> bytearray:
+        desc = bytearray(desc_size)
+        desc[0:4] = bytes([1, 1, 12, 0])
+        struct.pack_into("<I", desc, 4, sign_sz)
+        struct.pack_into("<Q", desc, 8, file_sz)
+        desc[16:48] = root
+        struct.pack_into("<I", desc, 112, 0x10)  # FLAG_SELF_SIGN
+        desc[255] = 3
+        return desc
+
+    cs_sec_off = None
+    cs_sec_size = None
+    for idx in range(e_shnum):
+        hdr = e_shoff + idx * shent_size
+        name_off, sh_type = struct.unpack_from("<II", data, hdr)
+        sec_off, sec_sz = struct.unpack_from("<QQ", data, hdr + 0x18)
+        nul = data.find(b"\x00", shstr_off + name_off, shstr_off + shstr_size)
+        name = data[shstr_off + name_off : nul].decode("utf-8", errors="ignore") if nul != -1 else ""
+        if name == ".codesign":
+            if sh_type == 1 and sec_off % page_size == 0 and sec_sz == page_size:
+                cs_sec_off = sec_off
+                cs_sec_size = sec_sz
+            break
+
+    if cs_sec_off is not None and cs_sec_size == page_size and cs_sec_off + page_size <= len(data):
+        t, l = struct.unpack_from("<II", data, cs_sec_off)
+        desc = data[cs_sec_off + 8 : cs_sec_off + 8 + desc_size]
+        sig = data[cs_sec_off + 8 + desc_size : cs_sec_off + 8 + desc_size + sig_size]
+        if (
+            t == 1
+            and l == desc_size + sig_size
+            and struct.unpack_from("<Q", desc, 8)[0] == len(data)
+            and _merkle_root(data, cs_sec_off) == desc[16:48]
+        ):
+            desc_for_sig = bytearray(desc)
+            struct.pack_into("<I", desc_for_sig, 4, 0)
+            if hashlib.sha256(desc_for_sig).digest() == sig:
+                return data
+        base = bytearray(data)
+        base[cs_sec_off : cs_sec_off + page_size] = b"\x00" * page_size
+        cs_offset = cs_sec_off
+    else:
+        cs_offset = ((len(data) + page_size - 1) // page_size) * page_size
+        new_shstr = data[shstr_off : shstr_off + shstr_size] + b".codesign\x00"
+        new_shstr_off = cs_offset + page_size
+        new_sht_off = new_shstr_off + len(new_shstr)
+        new_shnum = e_shnum + 1
+        new_total = new_sht_off + new_shnum * shent_size
+        base = bytearray(new_total)
+        base[: len(data)] = data
+        base[new_shstr_off : new_shstr_off + len(new_shstr)] = new_shstr
+        base[new_sht_off : new_sht_off + e_shnum * shent_size] = data[
+            e_shoff : e_shoff + e_shnum * shent_size
+        ]
+        new_shstr_hdr = new_sht_off + e_shstrndx * shent_size
+        struct.pack_into("<QQ", base, new_shstr_hdr + 0x18, new_shstr_off, len(new_shstr))
+        cs_hdr = new_sht_off + e_shnum * shent_size
+        struct.pack_into("<IIQ", base, cs_hdr, shstr_size, 1, 2)  # PROGBITS, SHF_ALLOC
+        struct.pack_into("<QQ", base, cs_hdr + 0x18, cs_offset, page_size)
+        struct.pack_into("<Q", base, cs_hdr + 0x30, page_size)
+        struct.pack_into("<Q", base, 0x28, new_sht_off)
+        struct.pack_into("<H", base, 0x3C, new_shnum)
+
+    root = _merkle_root(base, cs_offset)
+    sig = hashlib.sha256(_build_desc(0, len(base), root)).digest()
+    final_desc = _build_desc(sig_size, len(base), root)
+    payload = struct.pack("<II", 1, desc_size + sig_size) + bytes(final_desc) + sig
+    base[cs_offset : cs_offset + len(payload)] = payload
+    return bytes(base)
+
+
+def _is_exec_candidate(rel_posix: str, src_file: Path, head: bytes) -> bool:
+    if rel_posix.startswith("bin/") or src_file.name == "spawn-helper":
+        return True
+    if src_file.suffix in {".so", ".node"} or ".so." in src_file.name:
+        return True
+    if head.startswith(b"\x7fELF") or head.startswith(b"#!"):
+        return True
+    return bool(src_file.stat().st_mode & 0o100)
+
+
+def pack_hnp_directory(
+    src_dir: Path,
+    out_hnp: Path,
+    *,
+    self_sign_elfs: bool = True,
+    sign_tool_bin: Path | None = None,
+) -> Path:
+    """Pack a staged HNP directory containing `hnp.json` into a compliant `.hnp` archive.
+
+    Sets explicit POSIX permissions in the ZIP central directory (`0100755` for executables/ELFs,
+    `0100644` for regular files, `0120777` for symlinks) so `hmdfs`'s `0770` mask never strips
+    `S_IXOTH` (which `HnpUnZipForFile` checks to grant `0755` on extraction).
+    """
+    hnp_cfg_file = src_dir / "hnp.json"
+    if not hnp_cfg_file.is_file():
+        raise FileNotFoundError(f"pack_hnp_directory requires hnp.json at {hnp_cfg_file}")
+    hnp_cfg = json.loads(hnp_cfg_file.read_text(encoding="utf-8"))
+    if hnp_cfg.get("type") != "hnp-config" or not hnp_cfg.get("name"):
+        raise ValueError(f"Invalid hnp.json in {src_dir}: {hnp_cfg}")
+
+    out_hnp.parent.mkdir(parents=True, exist_ok=True)
+    tmp_hnp = out_hnp.with_suffix(".tmp.hnp")
+    t0 = time.monotonic()
+    file_count = 0
+    signed_count = 0
+
+    with zipfile.ZipFile(tmp_hnp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        for root, dirs, files in os.walk(src_dir, followlinks=False):
+            dirs.sort()
+            files.sort()
+            root_path = Path(root)
+            rel_root = root_path.relative_to(src_dir)
+
+            # Emit directory entries (and directory symlinks if any)
+            kept_dirs: list[str] = []
+            for d in dirs:
+                dp = root_path / d
+                rel_d = (rel_root / d).as_posix()
+                if dp.is_symlink():
+                    target = os.readlink(dp)
+                    zi = zipfile.ZipInfo(rel_d)
+                    zi.create_system = 3
+                    zi.external_attr = (stat.S_IFLNK | 0o777) << 16
+                    zf.writestr(zi, target.encode("utf-8"), compress_type=zipfile.ZIP_STORED)
+                    file_count += 1
+                else:
+                    kept_dirs.append(d)
+                    zi = zipfile.ZipInfo(rel_d + "/")
+                    zi.create_system = 3
+                    zi.external_attr = ((stat.S_IFDIR | 0o755) << 16) | 0x10
+                    zf.writestr(zi, b"", compress_type=zipfile.ZIP_STORED)
+            dirs[:] = kept_dirs
+
+            for fname in files:
+                fp = root_path / fname
+                rel_f = (rel_root / fname).as_posix()
+                if fp.is_symlink():
+                    target = os.readlink(fp)
+                    zi = zipfile.ZipInfo(rel_f)
+                    zi.create_system = 3
+                    zi.external_attr = (stat.S_IFLNK | 0o777) << 16
+                    zf.writestr(zi, target.encode("utf-8"), compress_type=zipfile.ZIP_STORED)
+                    file_count += 1
+                    continue
+
+                data = fp.read_bytes()
+                is_elf = len(data) >= 20 and data[:4] == b"\x7fELF"
+                if is_elf and self_sign_elfs:
+                    new_data = _elf_self_sign_bytes(data)
+                    if new_data != data:
+                        signed_count += 1
+                        data = new_data
+                    elif sign_tool_bin and b".codesign" not in data:
+                        with tempfile.NamedTemporaryFile(delete=False) as tf_in, tempfile.NamedTemporaryFile(
+                            delete=False
+                        ) as tf_out:
+                            tf_in.write(data)
+                            tf_in_path = Path(tf_in.name)
+                            tf_out_path = Path(tf_out.name)
+                        try:
+                            subprocess.run(
+                                [
+                                    str(sign_tool_bin),
+                                    "sign",
+                                    "-selfSign",
+                                    "1",
+                                    "-inFile",
+                                    str(tf_in_path),
+                                    "-outFile",
+                                    str(tf_out_path),
+                                ],
+                                check=True,
+                                capture_output=True,
+                            )
+                            data = tf_out_path.read_bytes()
+                            signed_count += 1
+                        finally:
+                            tf_in_path.unlink(missing_ok=True)
+                            tf_out_path.unlink(missing_ok=True)
+
+                is_exec = _is_exec_candidate(rel_f, fp, data[:64])
+                mode = (stat.S_IFREG | (0o755 if is_exec else 0o644)) << 16
+                zi = zipfile.ZipInfo(rel_f)
+                zi.create_system = 3
+                zi.external_attr = mode
+                zf.writestr(zi, data, compress_type=zipfile.ZIP_DEFLATED)
+                file_count += 1
+
+    tmp_hnp.replace(out_hnp)
+    print(
+        f"[ok] Packed HNP {out_hnp.name} ({file_count} entries, {signed_count} ELFs self-signed, "
+        f"{out_hnp.stat().st_size / 1048576:.1f} MiB) in {time.monotonic() - t0:.1f}s",
+        flush=True,
+    )
+    return out_hnp
+
+
 def resolve_hnp_packages(
     spec: dict[str, Any], spec_dir: Path, tc: Toolchains, force_hnp: bool = False
 ) -> list[tuple[Path, str]]:
-    """Resolve (and optionally build) `.hnp` archives declared in `hnpPackages`."""
+    """Resolve (and optionally build or pure-Python pack) `.hnp` archives declared in `hnpPackages`."""
     resolved: list[tuple[Path, str]] = []
     for item in spec.get("hnpPackages", []):
         if isinstance(item, str):
@@ -451,6 +702,7 @@ def resolve_hnp_packages(
             hnp_type = item.get("type", "private")
             hnp_path = resolve_path(item["path"], spec_dir)
             build_cmd = item.get("buildCmd")
+            src_dir_raw = item.get("srcDir")
             if build_cmd and (force_hnp or not hnp_path.is_file()):
                 cmd_list = (
                     ["/bin/sh", "-c", build_cmd]
@@ -465,6 +717,14 @@ def resolve_hnp_packages(
                     env.setdefault("BINARY_SIGN_TOOL", str(tc.sign_tool_bin))
                 env.setdefault("OHOS_SDK_ROOT", str(tc.ohos_sdk))
                 run_cmd(cmd_list, cwd=spec_dir, env=env)
+            if src_dir_raw and (force_hnp or not hnp_path.is_file()):
+                src_dir = resolve_path(src_dir_raw, spec_dir)
+                pack_hnp_directory(
+                    src_dir,
+                    hnp_path,
+                    self_sign_elfs=bool(item.get("selfSignElfs", True)),
+                    sign_tool_bin=tc.sign_tool_bin,
+                )
 
         if not hnp_path.is_file():
             raise FileNotFoundError(f"Declared HNP archive not found: {hnp_path}")
@@ -774,10 +1034,16 @@ def repack_payloads_into_hap(
                 continue
             zout.writestr(item, zin.read(item.filename))
         for arcname, src_path in replacement_libs.items():
-            zout.write(src_path, arcname, compress_type=zipfile.ZIP_DEFLATED)
+            zi = zipfile.ZipInfo(arcname)
+            zi.create_system = 0
+            zi.external_attr = 0
+            zout.writestr(zi, src_path.read_bytes(), compress_type=zipfile.ZIP_DEFLATED)
         for arcname, src_path in replacement_hnps.items():
-            # HNP archives are already compressed; store directly for sub-second repacking.
-            zout.write(src_path, arcname, compress_type=zipfile.ZIP_STORED)
+            # HNP archives are already compressed; store directly with zeroed outer attributes.
+            zi = zipfile.ZipInfo(arcname)
+            zi.create_system = 0
+            zi.external_attr = 0
+            zout.writestr(zi, src_path.read_bytes(), compress_type=zipfile.ZIP_STORED)
     tmp_hap.replace(out_unsigned_hap)
 
 
@@ -914,16 +1180,41 @@ def sign_hap(spec: dict[str, Any], tc: Toolchains, unsigned_hap: Path) -> Path:
         return subprocess.run(cmd, capture_output=True, text=True, env=env)
 
     t0 = time.monotonic()
-    combined_acls = base_acls + [a for a in optional_acls if a not in base_acls]
+    unique_opt = [a for a in optional_acls if a not in base_acls]
+    combined_acls = base_acls + unique_opt
     res = _try_sign(combined_acls)
-    if not signed_hap.is_file() and optional_acls:
+    if not signed_hap.is_file() and unique_opt:
         print(
-            f"[warn] Signing with optionalAcls {optional_acls} was rejected by current profile; "
-            f"retrying with base ACLs {base_acls}...",
+            f"[warn] Signing with all optionalAcls {unique_opt} failed; probing supported subset...",
             file=sys.stderr,
             flush=True,
         )
-        res = _try_sign(base_acls)
+        accepted = list(base_acls)
+        last_good_res: subprocess.CompletedProcess[str] | None = None
+        base_res = _try_sign(accepted)
+        if signed_hap.is_file():
+            last_good_res = base_res
+            kept_opt: list[str] = []
+            rejected_opt: list[str] = []
+            for opt_acl in unique_opt:
+                probe_res = _try_sign(accepted + [opt_acl])
+                if signed_hap.is_file():
+                    accepted.append(opt_acl)
+                    kept_opt.append(opt_acl)
+                    last_good_res = probe_res
+                else:
+                    rejected_opt.append(opt_acl)
+            if not signed_hap.is_file() and last_good_res is not None:
+                res = _try_sign(accepted)
+            elif last_good_res is not None:
+                res = last_good_res
+            print(
+                f"[info] Retained optionalAcls={kept_opt}; skipped unsupported optionalAcls={rejected_opt}",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            res = base_res
 
     if res.stdout:
         print(res.stdout, end="")
@@ -995,6 +1286,18 @@ def print_doctor(tc: Toolchains) -> None:
 def main() -> None:
     if len(sys.argv) >= 2 and sys.argv[1] == "--doctor":
         print_doctor(discover_toolchains())
+        return
+
+    if len(sys.argv) >= 2 and sys.argv[1] == "--pack-hnp":
+        if len(sys.argv) != 4:
+            raise SystemExit("Usage: gpui-ohos-pack --pack-hnp <staged_hnp_dir> <out.hnp>")
+        tc = discover_toolchains()
+        pack_hnp_directory(
+            Path(sys.argv[2]).expanduser().resolve(),
+            Path(sys.argv[3]).expanduser().resolve(),
+            self_sign_elfs=True,
+            sign_tool_bin=tc.sign_tool_bin,
+        )
         return
 
     if len(sys.argv) >= 2 and sys.argv[1] == "--cargo":
