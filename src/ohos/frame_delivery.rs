@@ -1,5 +1,5 @@
 #[cfg(feature = "native-vsync")]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::{
     cell::{Cell, RefCell},
     rc::{Rc, Weak},
@@ -50,6 +50,8 @@ pub(crate) struct WindowFrames {
     native: RefCell<Option<NativeFrames>>,
     #[cfg(feature = "native-vsync")]
     native_cleanup_pending: Cell<bool>,
+    #[cfg(feature = "native-vsync")]
+    vsync_clock: Cell<Option<(i64, Instant)>>,
 }
 
 impl WindowFrames {
@@ -76,6 +78,8 @@ impl WindowFrames {
             native: RefCell::new(None),
             #[cfg(feature = "native-vsync")]
             native_cleanup_pending: Cell::new(false),
+            #[cfg(feature = "native-vsync")]
+            vsync_clock: Cell::new(None),
         });
         #[cfg(feature = "native-vsync")]
         super::native_frames::register(&frames);
@@ -144,7 +148,14 @@ impl WindowFrames {
         } else {
             #[cfg(feature = "native-vsync")]
             {
-                self.native.borrow_mut().take();
+                self.vsync_clock.set(None);
+                if self.active.get() {
+                    if let Some(native) = self.native.borrow_mut().as_mut() {
+                        native.suspend();
+                    }
+                } else {
+                    self.native.borrow_mut().take();
+                }
                 Ok(())
             }
             #[cfg(not(feature = "native-vsync"))]
@@ -174,8 +185,11 @@ impl WindowFrames {
 
     #[cfg(feature = "native-vsync")]
     fn register_delivery(&self, app: &OpenHarmonyApp) -> napi_ohos::Result<()> {
-        app.set_frame_input_delivery_for(self.window_id.get(), FrameInputDelivery::OnDemand)?;
         let hz = app.refresh_rate();
+        if let Some(native) = self.native.borrow_mut().as_mut() {
+            return native.resume(hz);
+        }
+        app.set_frame_input_delivery_for(self.window_id.get(), FrameInputDelivery::OnDemand)?;
         let native = NativeFrames::new(self.window_id.get(), hz, app.main_thread()?)?;
         *self.native.borrow_mut() = Some(native);
         log::info!(
@@ -216,20 +230,43 @@ impl WindowFrames {
     }
 
     #[cfg(feature = "native-vsync")]
-    pub(crate) fn on_native_callback(self: &Rc<Self>, token: usize) {
+    fn resolve_vsync_instant(&self, vsync_timestamp_ns: i64) -> Instant {
+        let wall_now = Instant::now();
+        if vsync_timestamp_ns <= 0 {
+            self.vsync_clock.set(None);
+            return wall_now;
+        }
+        if let Some((base_ns, base_instant)) = self.vsync_clock.get() {
+            let delta_ns = vsync_timestamp_ns - base_ns;
+            // Keep locked to hardware VSync cadence across active bursts; re-anchor only
+            // after an idle gap (> 250ms) or clock discontinuity.
+            if (0..=250_000_000).contains(&delta_ns) {
+                let next_instant = base_instant + Duration::from_nanos(delta_ns as u64);
+                self.vsync_clock
+                    .set(Some((vsync_timestamp_ns, next_instant)));
+                return next_instant;
+            }
+        }
+        self.vsync_clock.set(Some((vsync_timestamp_ns, wall_now)));
+        wall_now
+    }
+
+    #[cfg(feature = "native-vsync")]
+    pub(crate) fn on_native_callback(self: &Rc<Self>, token: usize, vsync_timestamp_ns: i64) {
         if self
             .native
             .borrow()
             .as_ref()
-            .is_none_or(|native| native.token() != token)
+            .is_none_or(|native| native.is_paused() || native.token() != token)
         {
             return;
         }
+        let frame_time = self.resolve_vsync_instant(vsync_timestamp_ns);
         let _scope = FrameCallbackScope::enter(self.callback_active.clone());
         self.on_callback();
         // Arm before drawing, including the idle-threshold draw, which may
-        // create fresh demand. Deferred cleanup releases an idle receiver.
-        if self.active.get() {
+        // create fresh demand. Deferred cleanup suspends or releases an idle receiver.
+        if self.active.get() && self.demand.borrow().pending() != Some(DeliveryChange::Unregister) {
             let result = self.native.borrow_mut().as_mut().map(NativeFrames::request);
             if let Some(Err(error)) = result {
                 log::warn!(
@@ -244,7 +281,7 @@ impl WindowFrames {
             }
         }
         if let Some(window) = self.window.borrow().upgrade() {
-            window.borrow().draw_native_frame(Instant::now());
+            window.borrow().draw_native_frame(frame_time);
         }
     }
 }

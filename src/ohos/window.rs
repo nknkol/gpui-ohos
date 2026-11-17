@@ -61,6 +61,10 @@ use crate::{
 pub(crate) type BackHandler = Rc<RefCell<Option<Box<dyn FnMut()>>>>;
 type ResizeCallback = Box<dyn FnMut(Size<Pixels>, f32)>;
 
+/// Deduplication window for HarmonyOS PC / 2in1 devices where touchpad taps or
+/// touchscreen taps synthesize paired XComponent Mouse + Touch callbacks.
+const POINTER_DEDUP_WINDOW: Duration = Duration::from_millis(180);
+
 type WindowList = RefCell<Vec<Weak<RefCell<OhosWindow>>>>;
 type WindowIndex = RefCell<FxHashMap<i64, Weak<RefCell<OhosWindow>>>>;
 
@@ -104,6 +108,7 @@ pub(crate) struct OhosWindow {
     window_id: i64,
     title: Rc<RefCell<String>>,
     title_generation: Rc<Cell<u64>>,
+    pending_initial_zoom: Cell<bool>,
     restore_state: Rc<RefCell<Option<super::window_state::NativeWindowState>>>,
     restore_pending: Rc<Cell<bool>>,
     mode_operations: Rc<futures::lock::Mutex<()>>,
@@ -160,6 +165,9 @@ pub(crate) struct OhosWindow {
     pointer_screen_position: Cell<Option<(i64, i64)>>,
     pressed_mouse_button: Cell<MouseButtons>,
     mouse_click: RefCell<Option<MouseClickState>>,
+    last_native_mouse_button_at: Cell<Option<(Instant, Point<Pixels>)>>,
+    last_touch_tap_at: Cell<Option<(Instant, Point<Pixels>)>>,
+    suppressed_mouse_press: Cell<bool>,
     native_pointer_id: Cell<Option<i32>>,
     native_drag: Rc<RefCell<Option<openharmony_ability::NativeFileDrag>>>,
     native_drag_pending: Rc<Cell<bool>>,
@@ -713,6 +721,7 @@ impl OhosWindow {
                     .unwrap_or_default(),
             )),
             title_generation: Rc::new(Cell::new(0)),
+            pending_initial_zoom: Cell::new(false),
             restore_state: Rc::new(RefCell::new(None)),
             restore_pending: Rc::new(Cell::new(false)),
             mode_operations: Rc::new(futures::lock::Mutex::new(())),
@@ -791,6 +800,9 @@ impl OhosWindow {
             pointer_screen_position: Cell::new(None),
             pressed_mouse_button: Cell::new(MouseButtons::default()),
             mouse_click: RefCell::new(None),
+            last_native_mouse_button_at: Cell::new(None),
+            last_touch_tap_at: Cell::new(None),
+            suppressed_mouse_press: Cell::new(false),
             native_pointer_id: Cell::new(None),
             native_drag: Rc::new(RefCell::new(None)),
             native_drag_pending: Rc::new(Cell::new(false)),
@@ -880,11 +892,12 @@ impl OhosWindow {
         {
             return;
         }
+        let scale = *self.scale.borrow();
         let momentum_input = self.touch_scroll.borrow_mut().tick(frame_time);
         if let Some(input) = momentum_input {
             self.dispatch_input(input);
         }
-        let axis_momentum_input = self.axis_scroll.borrow_mut().tick(frame_time);
+        let axis_momentum_input = self.axis_scroll.borrow_mut().tick(frame_time, scale);
         if let Some(input) = axis_momentum_input {
             self.dispatch_input(input);
         }
@@ -1168,6 +1181,9 @@ impl OhosWindow {
                 }
             },
         );
+        if tap_allowed {
+            self.last_touch_tap_at.set(Some((now, position)));
+        }
         if phase == TouchPhase::Started
             && self.primary_touch.get() == Some(raw_id)
             && matches!(self.hit_window_control(), Some(WindowControlArea::Drag))
@@ -1240,6 +1256,7 @@ impl OhosWindow {
             subscription.cancel();
         }
         self.touch_tap_candidates.borrow_mut().clear();
+        self.last_touch_tap_at.set(None);
     }
 
     fn touch_moved_beyond_tap_slop(&self, raw_id: i32, position: Point<Pixels>) -> bool {
@@ -1292,6 +1309,24 @@ impl OhosWindow {
                 .iter()
                 .all(|point| point.event_tool_type == TouchPointTool::Mouse)
         {
+            return;
+        }
+        // HarmonyOS PC / 2in1 touchpad & touchscreen clicks often deliver both
+        // XComponent Mouse(Press/Release) and XComponent Touch(Down/Up) with
+        // TouchPointTool::Unknown (e.g. OHOS tool type TOUCHPAD = 9) or empty
+        // touch_points on Up. Suppress the shadow touch sequence when a native
+        // mouse button press/release already owns this pointer gesture.
+        let approx_pos = self.point_from_device_pixels(event.x, event.y);
+        let shadow_of_mouse = self.pressed_mouse_button.get().first().is_some()
+            || self
+                .last_native_mouse_button_at
+                .get()
+                .is_some_and(|(t, pos)| {
+                    Instant::now().saturating_duration_since(t) <= POINTER_DEDUP_WINDOW
+                        && (approx_pos - pos).magnitude()
+                            <= f64::from(GestureTuning::default().multi_tap_slop)
+                });
+        if shadow_of_mouse && !self.active_touches.borrow().contains_key(&event.id) {
             return;
         }
         match event.event_type {
@@ -2219,6 +2254,20 @@ impl OhosWindow {
         let flags =
             1 | if self.is_resizable { 2 | 8 } else { 0 } | if self.is_minimizable { 4 } else { 0 };
         let movable = self.is_movable;
+        let initial_zoom = self.pending_initial_zoom.take();
+        if initial_zoom && self.restore_state.borrow().is_none() {
+            self.remember_floating_state();
+        }
+        let requested_decorations = self.requested_decorations.get();
+        let has_controls = self.has_window_controls();
+        let decorations_state = self.decorations.clone();
+        let maximized = self.maximized.clone();
+        let restore_state = self.restore_state.clone();
+        let mode_operations = self.mode_operations.clone();
+        let window_weak = self
+            .window_index
+            .upgrade()
+            .and_then(|index| index.borrow().get(&window_id).cloned());
         self.foreground_executor
             .spawn(async move {
                 if let Err(error) = client.set_window_title(window_id, title).await {
@@ -2239,6 +2288,63 @@ impl OhosWindow {
                 if !movable {
                     if let Err(error) = client.set_window_draggable(window_id, false).await {
                         warn!("Failed to disable OHOS native window dragging: {error}");
+                    }
+                }
+                if initial_zoom && restore_state.borrow().is_none() {
+                    let _operation = mode_operations.lock().await;
+                    // Hide native server decorations BEFORE maximizing so HarmonyOS WMS
+                    // does not reserve the native title bar strip at the top of the work area.
+                    if has_controls && requested_decorations == WindowDecorations::Client {
+                        if let Ok(()) = client.set_window_decorations(window_id, false).await {
+                            decorations_state.set(WindowDecorations::Client);
+                        }
+                    }
+                    match client.maximize_window(window_id).await {
+                        Ok(()) => {
+                            maximized.set(true);
+                            if let Some(win_rc) = window_weak.and_then(|w| w.upgrade()) {
+                                let win = win_rc.borrow();
+                                if !win.closed.get() && !win.released.get() {
+                                    let rect_opt = win
+                                        .app
+                                        .borrow()
+                                        .as_ref()
+                                        .map(|a| a.content_rect_for(window_id));
+                                    if let Some(rect) = rect_opt {
+                                        if rect.width > 1 && rect.height > 1 {
+                                            let scale = win.scale_factor();
+                                            let win_rect = win
+                                                .app
+                                                .borrow()
+                                                .as_ref()
+                                                .map(|a| a.window_rect_for(window_id))
+                                                .unwrap_or_default();
+                                            let origin = if win_rect.width > 0 && win_rect.height > 0
+                                            {
+                                                point(
+                                                    px((win_rect.left + rect.left) as f32 / scale),
+                                                    px((win_rect.top + rect.top) as f32 / scale),
+                                                )
+                                            } else {
+                                                win.bounds.borrow().origin
+                                            };
+                                            *win.bounds.borrow_mut() = Bounds::new(
+                                                origin,
+                                                size(
+                                                    px(rect.width as f32 / scale),
+                                                    px(rect.height as f32 / scale),
+                                                ),
+                                            );
+                                        }
+                                    }
+                                    win.notify_window_mode_changed();
+                                    win.refresh_insets();
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            warn!("Failed to apply OHOS initial maximize: {error}");
+                        }
                     }
                 }
             })
@@ -2383,6 +2489,11 @@ impl OhosWindow {
         }
         self.visibility.set(WindowVisibility::Visible);
         self.sync_frame_delivery();
+        if self.window_id == 0 {
+            // The UIAbility main window is already shown by WindowStage; calling
+            // showWindow() on it can reset window placement or race initial maximize.
+            return Ok(());
+        }
         let client = self
             .window_client()
             .ok_or_else(|| anyhow::anyhow!("OHOS window bridge is unavailable"))?;
@@ -3105,6 +3216,25 @@ impl OhosWindow {
                 let event_button = Self::mouse_button(mouse_event.button);
                 match mouse_event.action {
                     MouseAction::Press => {
+                        let now = Instant::now();
+                        let tuning = GestureTuning::default();
+                        // Native Mouse(Press) always wins over an in-flight shadow Touch(Down)
+                        // on HarmonyOS PC / 2in1 (where XComponent delivers Touch(Down) right
+                        // before Mouse(Press), and Touch(Down) stays in Pending without emitting
+                        // MouseDown, which would otherwise swallow every drag & resize gesture).
+                        if !self.active_touches.borrow().is_empty() {
+                            self.cancel_touch_input();
+                        }
+                        let post_touch_tap_echo = self.last_touch_tap_at.get().is_some_and(|(t, pos)| {
+                            now.saturating_duration_since(t) <= POINTER_DEDUP_WINDOW
+                                && (position - pos).magnitude()
+                                    <= f64::from(tuning.multi_tap_slop)
+                        });
+                        if post_touch_tap_echo {
+                            self.suppressed_mouse_press.set(true);
+                            return;
+                        }
+                        self.suppressed_mouse_press.set(false);
                         self.axis_scroll
                             .borrow_mut()
                             .cancel(|input| self.dispatch_input(input));
@@ -3112,8 +3242,7 @@ impl OhosWindow {
                         let Some(button) = event_button else {
                             return;
                         };
-                        let now = Instant::now();
-                        let tuning = GestureTuning::default();
+                        self.last_native_mouse_button_at.set(Some((now, position)));
                         let mut click = self.mouse_click.borrow_mut();
                         let click_count = click
                             .as_ref()
@@ -3153,6 +3282,10 @@ impl OhosWindow {
                         }
                     }
                     MouseAction::Release => {
+                        let now = Instant::now();
+                        if self.suppressed_mouse_press.replace(false) {
+                            return;
+                        }
                         self.manipulation.set(None);
                         if let Some(subscription) = self.move_subscription.borrow().as_ref() {
                             subscription.cancel();
@@ -3161,6 +3294,7 @@ impl OhosWindow {
                         else {
                             return;
                         };
+                        self.last_native_mouse_button_at.set(Some((now, position)));
                         let mut held = self.pressed_mouse_button.get();
                         held.release(button);
                         self.pressed_mouse_button.set(held);
@@ -3225,8 +3359,9 @@ impl OhosWindow {
                     && pointer.action == UIInputAction::Move
                 {
                     // Releases and hover exits can both be absent outside a native
-                    // window. Reconcile buttons before using re-entry coordinates.
-                    if pointer.mouse_buttons_pressed == Some(false) {
+                    // window. Reconcile buttons only on re-entry (when hover was lost),
+                    // so in-window touchpad click-and-drag is never prematurely aborted.
+                    if !self.hovered.get() && pointer.mouse_buttons_pressed == Some(false) {
                         if self.pressed_mouse_button.get().first().is_some() {
                             self.cancel_mouse_input();
                         }
@@ -3275,6 +3410,7 @@ impl OhosWindow {
                             touch_phase,
                             modifiers,
                             axis_event.pointer.timestamp,
+                            scale,
                             now,
                             |input| self.dispatch_input(input),
                         );
@@ -3300,6 +3436,7 @@ impl OhosWindow {
             )) => {
                 if pan.pointer.source_type == UIInputSourceType::Mouse
                     || pan.pointer.tool_type == UIInputToolType::Mouse
+                    || self.pressed_mouse_button.get().first().is_some()
                 {
                     return;
                 }
@@ -4519,11 +4656,19 @@ impl PlatformWindow for OhosWindow {
         if !self.is_resizable {
             return;
         }
+        if !self.surface_available.get() {
+            self.pending_initial_zoom
+                .set(!self.pending_initial_zoom.get());
+            return;
+        }
         let Some(client) = self.window_client() else {
             return;
         };
         let window_id = self.window_id;
         let state = self.maximized.clone();
+        let has_controls = self.has_window_controls();
+        let requested_decorations = self.requested_decorations.get();
+        let decorations_state = self.decorations.clone();
         let window = self
             .window_index
             .upgrade()
@@ -4538,6 +4683,15 @@ impl PlatformWindow for OhosWindow {
                     window.floating_state.get()
                 });
                 let next = !state.get();
+                if next
+                    && has_controls
+                    && requested_decorations == WindowDecorations::Client
+                    && decorations_state.get() != WindowDecorations::Client
+                {
+                    if let Ok(()) = client.set_window_decorations(window_id, false).await {
+                        decorations_state.set(WindowDecorations::Client);
+                    }
+                }
                 let result = if next {
                     client.maximize_window(window_id).await
                 } else {

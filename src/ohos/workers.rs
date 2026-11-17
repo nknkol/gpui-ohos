@@ -41,7 +41,9 @@ pub(crate) struct Workers;
 
 impl Workers {
     pub(crate) fn start(queue: Arc<TaskQueue<RunnableVariant>>) {
-        let count = thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 8));
+        // Kirin X90 (HarmonyOS PC) exposes up to 20 hardware threads; allow up to 16 baseline
+        // background workers while reserving headroom for UI, VSync, and GPU driver threads.
+        let count = thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 16));
         let workers = Arc::new(Mutex::new(Vec::new()));
         for index in 0..count {
             if let Err(error) = Self::spawn(queue.clone(), &workers, index, false) {

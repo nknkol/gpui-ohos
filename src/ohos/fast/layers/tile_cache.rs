@@ -20,14 +20,14 @@ use crate::ohos::wgpu_renderer::fast::frame::FrameTarget;
 use crate::ohos::{path_targets::PathTargets, wgpu_renderer::GlobalParams};
 
 /// How much tile texture memory a window keeps, by default (spec §5.6).
-pub(crate) const DEFAULT_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const DEFAULT_BUDGET_BYTES: u64 = 96 * 1024 * 1024;
 
-/// Frames a layer that no frame composites keeps its tiles for; the core
+/// Frames a layer that no frame has composited keeps its tiles for; the core
 /// drops such a layer after as many.
 const LAYER_KEEP_FRAMES: u64 = 120;
 
-/// Textures of released tiles kept for new tiles to reuse.
-const POOL_LIMIT: usize = 8;
+/// Textures of released tiles kept for new tiles to reuse without GLES `glTexStorage2D` stalls.
+const POOL_LIMIT: usize = 48;
 
 /// A window's scroll layer tiles, and what rasterizing them takes.
 pub(crate) struct TileCache {
@@ -290,6 +290,7 @@ impl TileCache {
             .map(|((key, coord), tile)| (tile.last_used, *key, *coord))
             .collect();
         candidates.sort_by_key(|&(last_used, key, coord)| (last_used, key.0, coord));
+        let mut recycled: Vec<TileTexture> = Vec::new();
         for (_, key, coord) in candidates {
             if bytes <= budget_bytes {
                 break;
@@ -298,6 +299,20 @@ impl TileCache {
                 if tile.valid || tile.texture.is_some() {
                     bytes -= tile_bytes(tile.tile_size);
                 }
+                if recycled.len() < POOL_LIMIT {
+                    if let Some(tex) = tile.texture {
+                        recycled.push(tex);
+                    }
+                }
+            }
+        }
+        // Keep a bounded pool of warm textures so `prepare()` immediately rebinds them
+        // to incoming tiles without hitting GLES `glDeleteTextures` + `glTexStorage2D`.
+        for tex in recycled {
+            let cost = tile_bytes(tex.size);
+            if self.pool.len() < POOL_LIMIT && bytes + cost <= budget_bytes {
+                bytes += cost;
+                self.pool.push(tex);
             }
         }
     }

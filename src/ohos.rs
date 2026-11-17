@@ -165,12 +165,15 @@ pub fn try_current_platform(
     app: OpenHarmonyApp,
     options: PlatformOptions,
 ) -> anyhow::Result<std::rc::Rc<dyn gpui::Platform>> {
+    *REGISTERED_APP.lock() = Some((app.clone(), options.clone()));
     Ok(std::rc::Rc::new(platform::OhosPlatform::new(app, options)?))
 }
 
 pub fn current_platform(app: OpenHarmonyApp, _headless: bool) -> std::rc::Rc<dyn gpui::Platform> {
+    let options = PlatformOptions::default();
+    *REGISTERED_APP.lock() = Some((app.clone(), options.clone()));
     std::rc::Rc::new(
-        platform::OhosPlatform::new(app, PlatformOptions::default())
+        platform::OhosPlatform::new(app, options)
             .inspect_err(|err| {
                 log::error!("Failed to initialize OHOS platform: {}", err);
             })
@@ -239,6 +242,25 @@ pub use raw_file_assets::RawFileAssets;
 pub use pointer_position::NativePointerPosition;
 #[cfg(feature = "native-input")]
 pub use scroll_input::NativeScrollDelta;
+
+/// Set or clear Always-On-Top (`setWindowTopmost`) on the main OpenHarmony window (`window_id = 0`).
+///
+/// On HarmonyOS PC / 2in1, `setWindowTopmost` requires freeform window mode (error 801 when maximized),
+/// so enabling topmost on a maximized window recovers it to freeform first.
+pub async fn set_main_window_topmost(topmost: bool) -> anyhow::Result<()> {
+    let (app, _) = registered_openharmony_app()
+        .ok_or_else(|| anyhow::anyhow!("OpenHarmonyApp is not registered"))?;
+    let client = openharmony_ability_plugin_window::WindowClient::new(&app)
+        .map_err(|err| anyhow::anyhow!("Cannot create OHOS WindowClient: {err}"))?;
+    if topmost && client.is_window_maximized(0).await.unwrap_or(false) {
+        let _ = client.recover_window(0).await;
+        smol::Timer::after(std::time::Duration::from_millis(80)).await;
+    }
+    client
+        .set_window_topmost(0, topmost)
+        .await
+        .map_err(|err| anyhow::anyhow!("setWindowTopmost({topmost}) failed: {err}"))
+}
 
 #[cfg(feature = "audio")]
 pub use audio::{

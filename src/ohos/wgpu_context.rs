@@ -75,7 +75,7 @@ impl WgpuContext {
             display: None,
         });
 
-        let adapter = smol::block_on(Self::select_adapter(&instance, device_id_filter))?;
+        let adapter = smol::block_on(Self::select_adapter(&instance, backends, device_id_filter))?;
 
         log::info!(
             "Selected GPU adapter: {:?} ({:?})",
@@ -123,42 +123,83 @@ impl WgpuContext {
 
     async fn select_adapter(
         instance: &wgpu::Instance,
+        backends: wgpu::Backends,
         device_id_filter: Option<u32>,
     ) -> anyhow::Result<wgpu::Adapter> {
+        // NOTE: Upstream wgpu-hal 30.0.x implements `RawWindowHandle::OhosNdk`
+        // (`OHNativeWindow`) presentation exclusively in `gles/egl.rs` (hardware Maleoon
+        // GPU via native OpenHarmony EGL) and does not yet implement `VK_OHOS_surface`.
+        // Always prefer the hardware GLES/EGL adapter when `Backends::GL` is active so
+        // `WgpuRenderer` window surface creation succeeds; `Backends::VULKAN` remains
+        // available when `WGPU_BACKEND=vulkan` is explicitly requested or `gles` is off.
         #[cfg(feature = "gles")]
-        if let Some(hal_instance) = unsafe { instance.as_hal::<wgpu::hal::api::Gles>() } {
-            // SAFETY: The exposed adapters are enumerated from the HAL instance owned by
-            // this exact wgpu instance and are immediately imported back into it.
-            let mut adapters = unsafe { hal_instance.enumerate_adapters(None) };
-            anyhow::ensure!(!adapters.is_empty(), "No OpenGL ES adapters found");
+        if backends.contains(wgpu::Backends::GL) {
+            if let Some(hal_instance) = unsafe { instance.as_hal::<wgpu::hal::api::Gles>() } {
+                // SAFETY: The exposed adapters are enumerated from the HAL instance owned by
+                // this exact wgpu instance and are immediately imported back into it.
+                let mut adapters = unsafe { hal_instance.enumerate_adapters(None) };
+                if !adapters.is_empty() {
+                    let selected_index = device_id_filter
+                        .and_then(|device_id| {
+                            adapters
+                                .iter()
+                                .position(|adapter| adapter.info.device == device_id)
+                        })
+                        .unwrap_or(0);
+                    let mut adapter = adapters.swap_remove(selected_index);
 
-            let selected_index = device_id_filter
-                .and_then(|device_id| {
-                    adapters
-                        .iter()
-                        .position(|adapter| adapter.info.device == device_id)
-                })
-                .unwrap_or(0);
-            let mut adapter = adapters.swap_remove(selected_index);
+                    // OpenHarmony's GLES compatibility layer reports GL_MAX_VARYING_COMPONENTS
+                    // using a non-component unit. wgpu-hal divides that value by four and exposes
+                    // only 7 variables on the emulator, although GLES 3 guarantees at least 15.
+                    // Correct the imported adapter metadata in the platform adaptation layer.
+                    let webgl2_minimum =
+                        wgpu::Limits::downlevel_webgl2_defaults().max_inter_stage_shader_variables;
+                    if adapter.capabilities.limits.max_inter_stage_shader_variables < webgl2_minimum
+                    {
+                        log::warn!(
+                            "Correcting OpenHarmony GLES max_inter_stage_shader_variables from {} to {}",
+                            adapter.capabilities.limits.max_inter_stage_shader_variables,
+                            webgl2_minimum
+                        );
+                        adapter.capabilities.limits.max_inter_stage_shader_variables =
+                            webgl2_minimum;
+                    }
 
-            // OpenHarmony's GLES compatibility layer reports GL_MAX_VARYING_COMPONENTS
-            // using a non-component unit. wgpu-hal divides that value by four and exposes
-            // only 7 variables on the emulator, although GLES 3 guarantees at least 15.
-            // Correct the imported adapter metadata in the platform adaptation layer.
-            let webgl2_minimum =
-                wgpu::Limits::downlevel_webgl2_defaults().max_inter_stage_shader_variables;
-            if adapter.capabilities.limits.max_inter_stage_shader_variables < webgl2_minimum {
-                log::warn!(
-                    "Correcting OpenHarmony GLES max_inter_stage_shader_variables from {} to {}",
-                    adapter.capabilities.limits.max_inter_stage_shader_variables,
-                    webgl2_minimum
-                );
-                adapter.capabilities.limits.max_inter_stage_shader_variables = webgl2_minimum;
+                    // SAFETY: `adapter` was created by `hal_instance`, which is the internal
+                    // GLES instance backing `instance`.
+                    return Ok(unsafe { instance.create_adapter_from_hal(adapter) });
+                }
+                log::warn!("OpenHarmony GLES HAL returned 0 adapters");
             }
+        }
 
-            // SAFETY: `adapter` was created by `hal_instance`, which is the internal
-            // GLES instance backing `instance`.
-            return Ok(unsafe { instance.create_adapter_from_hal(adapter) });
+        #[cfg(feature = "vulkan")]
+        if backends.contains(wgpu::Backends::VULKAN) {
+            let mut vk_adapters: Vec<wgpu::Adapter> =
+                instance.enumerate_adapters(wgpu::Backends::VULKAN).await;
+            if !vk_adapters.is_empty() {
+                if let Some(device_id) = device_id_filter {
+                    if let Some(idx) = vk_adapters
+                        .iter()
+                        .position(|a| a.get_info().device == device_id)
+                    {
+                        return Ok(vk_adapters.swap_remove(idx));
+                    }
+                } else {
+                    vk_adapters.sort_by_key(|a| match a.get_info().device_type {
+                        wgpu::DeviceType::DiscreteGpu => 0u8,
+                        wgpu::DeviceType::IntegratedGpu => 1,
+                        wgpu::DeviceType::VirtualGpu => 2,
+                        wgpu::DeviceType::Other => 3,
+                        wgpu::DeviceType::Cpu => 4,
+                    });
+                    return Ok(vk_adapters.swap_remove(0));
+                }
+            } else {
+                log::warn!(
+                    "Vulkan backend enabled, but enumerate_adapters(VULKAN) returned 0 adapters; falling back"
+                );
+            }
         }
 
         if let Some(device_id) = device_id_filter {

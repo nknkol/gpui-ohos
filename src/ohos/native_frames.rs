@@ -33,6 +33,8 @@ static NEXT_TOKEN: AtomicUsize = AtomicUsize::new(1);
 pub(crate) struct NativeFrames {
     vsync: Vsync,
     token: usize,
+    hz: i32,
+    paused: bool,
     main_thread: MainThreadScheduler,
     window_id: i64,
 }
@@ -45,6 +47,9 @@ impl NativeFrames {
             .ok_or_else(|| Error::from_reason(format!("Invalid display refresh rate: {hz}")))?;
         let vsync = Vsync::try_new("gpui-native-render")
             .ok_or_else(|| Error::from_reason("NativeVSync creation failed"))?;
+        // NOTE: Do NOT enable `OH_NativeVSync_SetDVSyncSwitch(true)` on GLES (`eglSwapBuffers`)
+        // without `OH_NativeWindow` `SET_UI_TIMESTAMP` ahead-of-phase buffer tagging; otherwise
+        // Rosen compositor buffer-queue phase slips cause intermittent 2-way scroll ghosting.
         let result = vsync.set_expected_frame_rate_range(ExpectedRateRange {
             min: hz,
             max: hz,
@@ -58,6 +63,8 @@ impl NativeFrames {
         let mut connection = Self {
             vsync,
             token: NEXT_TOKEN.fetch_add(1, Ordering::Relaxed),
+            hz,
+            paused: false,
             main_thread,
             window_id,
         };
@@ -69,12 +76,49 @@ impl NativeFrames {
         self.token
     }
 
+    pub(crate) fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    /// Suspend armed callbacks while idle without destroying the underlying
+    /// `OH_NativeVSync` receiver, eliminating first-input wakeup IPC/allocation spikes.
+    pub(crate) fn suspend(&mut self) {
+        self.paused = true;
+        self.token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Resume a warm `OH_NativeVSync` receiver, updating rate only if the panel Hz changed.
+    pub(crate) fn resume(&mut self, hz: u32) -> Result<()> {
+        let hz = i32::try_from(hz)
+            .ok()
+            .filter(|hz| *hz > 0)
+            .ok_or_else(|| Error::from_reason(format!("Invalid display refresh rate: {hz}")))?;
+        if self.hz != hz {
+            let result = self.vsync.set_expected_frame_rate_range(ExpectedRateRange {
+                min: hz,
+                max: hz,
+                expected: hz,
+            });
+            if result != 0 {
+                return Err(Error::from_reason(format!(
+                    "NativeVSync frame-rate request failed: {result}"
+                )));
+            }
+            self.hz = hz;
+        }
+        self.paused = false;
+        self.token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+        self.request()
+    }
+
     pub(crate) fn request(&mut self) -> Result<()> {
         let main_thread = self.main_thread.clone();
         let window_id = self.window_id;
         let token = self.token;
-        let result = self.vsync.request_frame_once(move |_| {
+        let result = self.vsync.request_frame_once(move |vsync_timestamp_ns| {
             // Binding callbacks may run on the VSync thread; GPUI stays on its UI thread.
+            // Forward the exact hardware VSync nanosecond timestamp so scroll physics never
+            // suffers from cross-thread wakeup jitter.
             if let Err(error) = main_thread.dispatch(move || {
                 let frames = WINDOWS.with_borrow(|windows| {
                     windows
@@ -83,7 +127,7 @@ impl NativeFrames {
                         .find(|frames| frames.window_id() == window_id)
                 });
                 if let Some(frames) = frames {
-                    frames.on_native_callback(token);
+                    frames.on_native_callback(token, vsync_timestamp_ns);
                 }
             }) {
                 log::warn!("Cannot dispatch NativeVSync for window {window_id}: {error}");

@@ -172,8 +172,8 @@ impl WgpuAtlasState {
         kind: AtlasTextureKind,
     ) -> &mut WgpuAtlasTexture {
         const DEFAULT_ATLAS_SIZE: Size<DevicePixels> = Size {
-            width: DevicePixels(1024),
-            height: DevicePixels(1024),
+            width: DevicePixels(2048),
+            height: DevicePixels(2048),
         };
 
         let size = min_size.max(&DEFAULT_ATLAS_SIZE);
