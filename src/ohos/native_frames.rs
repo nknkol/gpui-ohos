@@ -26,10 +26,11 @@ pub(crate) fn register(frames: &Rc<WindowFrames>) {
     });
 }
 
-/// Prefer `hz`, allow the arbiter down to half rate, never cap below `hz`.
+/// Pin the vote to exactly `hz` (the panel's TOP rate). A loose range lets the LTPO
+/// arbiter settle on an intermediate rate (e.g. 90Hz -> ~11ms intervals, 70-90 fps).
 fn vote(hz: i32) -> ExpectedRateRange {
     ExpectedRateRange {
-        min: (hz / 2).max(1),
+        min: hz,
         max: hz,
         expected: hz,
     }
