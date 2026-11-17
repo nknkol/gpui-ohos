@@ -99,15 +99,17 @@ impl NativeFrames {
             .ok()
             .filter(|hz| *hz > 0)
             .ok_or_else(|| Error::from_reason(format!("Invalid display refresh rate: {hz}")))?;
-        // Re-vote on every resume: an idle receiver's vote may have been dropped by the
-        // frame-rate arbiter, and a stale lower vote must never survive.
-        let result = self.vsync.set_expected_frame_rate_range(vote(hz));
-        if result != 0 {
-            return Err(Error::from_reason(format!(
-                "NativeVSync frame-rate request failed: {result}"
-            )));
+        // Only re-vote when the target changes: re-sending the vote on every resume makes
+        // the LTPO arbiter re-evaluate (and ramp 60->90->120) at each scroll start.
+        if self.hz != hz {
+            let result = self.vsync.set_expected_frame_rate_range(vote(hz));
+            if result != 0 {
+                return Err(Error::from_reason(format!(
+                    "NativeVSync frame-rate request failed: {result}"
+                )));
+            }
+            self.hz = hz;
         }
-        self.hz = hz;
         self.paused = false;
         self.token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
         self.request()
