@@ -911,10 +911,13 @@ impl OhosPlatform {
                     let Some(level) = event.thermal_level else {
                         continue;
                     };
+                    // OHOS ThermalLevel: 0 COOL, 1 NORMAL, 2 WARM, 3 HOT, 4 OVERHEATED,
+                    // 5 WARNING, 6 EMERGENCY, 7 ESCAPE. GPUI throttles to 60fps on Serious,
+                    // and HOT is routine on a PC under load/charging, so HOT must not throttle.
                     let state = match level {
                         0 | 1 => ThermalState::Nominal,
-                        2 => ThermalState::Fair,
-                        3 | 4 => ThermalState::Serious,
+                        2 | 3 => ThermalState::Fair,
+                        4 | 5 => ThermalState::Serious,
                         _ => ThermalState::Critical,
                     };
                     log::info!("OHOS thermal level {level} mapped to {state:?}");

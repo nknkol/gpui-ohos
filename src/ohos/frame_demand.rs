@@ -1,6 +1,4 @@
-/// ~1s at 120Hz: keep the VSync receiver (and its 120Hz vote) alive across short gaps
-/// between scroll bursts so the LTPO panel does not drop and re-ramp (start-of-scroll hitch).
-pub(crate) const IDLE_CALLBACK_THRESHOLD: usize = 120;
+pub(crate) const IDLE_CALLBACK_THRESHOLD: usize = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DeliveryChange {

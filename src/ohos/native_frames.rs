@@ -26,11 +26,19 @@ pub(crate) fn register(frames: &Rc<WindowFrames>) {
     });
 }
 
-/// Pin the vote to exactly `hz` (the panel's TOP rate). A loose range lets the LTPO
-/// arbiter settle on an intermediate rate (e.g. 90Hz -> ~11ms intervals, 70-90 fps).
+/// The floor the arbiter may fall back to when the application cannot hold `hz`.
+///
+/// Pinning `min` to the top rate makes every missed deadline cost a whole slot:
+/// 120 -> 60, a half-rate staircase that then feeds itself (a 13 ms frame queues
+/// the next event behind it). Letting the arbiter step down to 90 keeps the
+/// cadence continuous at 11.1 ms, so a frame that overruns 8.33 ms still lands on
+/// the next slot instead of halving the rate.
+const VOTE_FLOOR_HZ: i32 = 90;
+
+/// Ask for `hz`, accept one step below it before the panel gives up entirely.
 fn vote(hz: i32) -> ExpectedRateRange {
     ExpectedRateRange {
-        min: hz,
+        min: hz.min(VOTE_FLOOR_HZ),
         max: hz,
         expected: hz,
     }

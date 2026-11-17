@@ -268,6 +268,7 @@ impl WindowFrames {
             return;
         }
         let frame_time = self.resolve_vsync_instant(vsync_timestamp_ns);
+        let cb_start = Instant::now();
         let _scope = FrameCallbackScope::enter(self.callback_active.clone());
         self.on_callback();
         // Arm before drawing, including the idle-threshold draw, which may
@@ -289,5 +290,75 @@ impl WindowFrames {
         if let Some(window) = self.window.borrow().upgrade() {
             window.borrow().draw_native_frame(frame_time);
         }
+        vsync_stats::note(vsync_timestamp_ns, cb_start, cb_start.elapsed());
+    }
+}
+
+/// Per-second VSync pacing diagnostics (hilog `ndsh-vsync`): hardware VSync gaps
+/// (skipped panel slots), main-thread callback arrival gaps and callback (draw) cost.
+#[cfg(feature = "native-vsync")]
+mod vsync_stats {
+    use std::cell::RefCell;
+    use std::time::{Duration, Instant};
+
+    #[derive(Default)]
+    struct S {
+        since: Option<Instant>,
+        last_ts: i64,
+        last_arrival: Option<Instant>,
+        n: u32,
+        hw_gap_sum: i64,
+        hw_gap_max: i64,
+        skipped: u32,
+        arr_gap_max: Duration,
+        cb_sum: Duration,
+        cb_max: Duration,
+        cb_over: u32,
+    }
+    thread_local! { static ST: RefCell<S> = RefCell::new(S::default()); }
+
+    pub(super) fn note(ts: i64, arrival: Instant, cb: Duration) {
+        ST.with_borrow_mut(|s| {
+            let since = *s.since.get_or_insert(arrival);
+            if s.last_ts > 0 && ts > s.last_ts && ts - s.last_ts < 500_000_000 {
+                let gap = ts - s.last_ts;
+                s.hw_gap_sum += gap;
+                s.hw_gap_max = s.hw_gap_max.max(gap);
+                if gap > 12_500_000 {
+                    s.skipped += ((gap + 4_166_666) / 8_333_333 - 1) as u32;
+                }
+            }
+            if let Some(prev) = s.last_arrival {
+                let g = arrival.saturating_duration_since(prev);
+                if g < Duration::from_millis(500) {
+                    s.arr_gap_max = s.arr_gap_max.max(g);
+                }
+            }
+            s.last_ts = ts;
+            s.last_arrival = Some(arrival);
+            s.n += 1;
+            s.cb_sum += cb;
+            s.cb_max = s.cb_max.max(cb);
+            if cb > Duration::from_micros(8_333) {
+                s.cb_over += 1;
+            }
+            let el = arrival.saturating_duration_since(since);
+            if el >= Duration::from_secs(5) {
+                let n = s.n.max(1);
+                log::info!(
+                    "ndsh-vsync: cb={} ({:.0}/s) hw_gap_avg={:.2}ms hw_gap_max={:.2}ms skipped_slots={} arrival_gap_max={:.2}ms cb_avg={:.2}ms cb_max={:.2}ms cb_over_budget={}",
+                    s.n,
+                    s.n as f64 / el.as_secs_f64(),
+                    s.hw_gap_sum as f64 / (n.saturating_sub(1).max(1)) as f64 / 1e6,
+                    s.hw_gap_max as f64 / 1e6,
+                    s.skipped,
+                    s.arr_gap_max.as_secs_f64() * 1e3,
+                    s.cb_sum.as_secs_f64() * 1e3 / n as f64,
+                    s.cb_max.as_secs_f64() * 1e3,
+                    s.cb_over
+                );
+                *s = S { last_ts: s.last_ts, last_arrival: s.last_arrival, ..S::default() };
+            }
+        });
     }
 }

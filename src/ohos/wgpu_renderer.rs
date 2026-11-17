@@ -20,6 +20,76 @@ use std::num::NonZeroU64;
 #[cfg(not(feature = "fast"))]
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Instant;
+
+/// Split the present path so a render thread parked in `eglSwapBuffers` can be
+/// told apart from one that is actually drawing.
+///
+/// `acquire` is `get_current_texture` (the driver waits for a free buffer),
+/// `record` is scene encoding plus `queue.submit`, and `present` is
+/// `eglSwapBuffers`, which under FIFO can sleep the render thread until the next
+/// panel slot instead of returning immediately.
+mod present_stats {
+    use std::cell::RefCell;
+    use std::time::{Duration, Instant};
+
+    struct Stats {
+        last: Instant,
+        frames: u32,
+        acquire_us: u64,
+        record_us: u64,
+        present_us: u64,
+        total_us: u64,
+    }
+
+    thread_local! {
+        static STATS: RefCell<Option<Stats>> = const { RefCell::new(None) };
+    }
+
+    /// Flush interval, matched to the app's frame summary so both describe the
+    /// same window when a scroll is measured by hand.
+    const FLUSH: Duration = Duration::from_secs(5);
+
+    pub(super) fn note(acquire: Duration, record: Duration, present: Duration, total: Duration) {
+        STATS.with_borrow_mut(|slot| {
+            let stats = slot.get_or_insert_with(|| Stats {
+                last: Instant::now(),
+                frames: 0,
+                acquire_us: 0,
+                record_us: 0,
+                present_us: 0,
+                total_us: 0,
+            });
+            stats.frames += 1;
+            stats.acquire_us += acquire.as_micros() as u64;
+            stats.record_us += record.as_micros() as u64;
+            stats.present_us += present.as_micros() as u64;
+            stats.total_us += total.as_micros() as u64;
+            let elapsed = stats.last.elapsed();
+            if elapsed < FLUSH {
+                return;
+            }
+            let frames = stats.frames.max(1) as f64;
+            log::warn!(
+                "ndsh-present: fps={:.0} frames={} total={:.0}us acquire={:.0}us record={:.0}us present={:.0}us",
+                frames / elapsed.as_secs_f64(),
+                stats.frames,
+                stats.total_us as f64 / frames,
+                stats.acquire_us as f64 / frames,
+                stats.record_us as f64 / frames,
+                stats.present_us as f64 / frames
+            );
+            *stats = Stats {
+                last: Instant::now(),
+                frames: 0,
+                acquire_us: 0,
+                record_us: 0,
+                present_us: 0,
+                total_us: 0,
+            };
+        });
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -1274,6 +1344,8 @@ impl WgpuRenderer {
     pub fn draw(&mut self, scene: &Scene) -> Presentation {
         self.atlas.before_frame();
 
+        let draw_start = Instant::now();
+        let acquire_start = draw_start;
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
@@ -1296,15 +1368,21 @@ impl WgpuRenderer {
                 return Presentation::Unavailable;
             }
         };
+        let acquire = acquire_start.elapsed();
         let frame_view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
         #[cfg(feature = "fast")]
         {
+            let record_start = Instant::now();
             let result =
                 fast::frame::record_into(self, scene, &frame_view, wgpu::Color::TRANSPARENT);
+            let record = record_start.elapsed();
+            let present_start = Instant::now();
             self.queue.present(frame);
+            let present = present_start.elapsed();
+            present_stats::note(acquire, record, present, draw_start.elapsed());
             match result {
                 Ok(_) => Presentation::Presented,
                 Err(error) => {
@@ -1314,7 +1392,10 @@ impl WgpuRenderer {
             }
         }
         #[cfg(not(feature = "fast"))]
-        self.draw_pre_scene(scene, &frame_view, frame)
+        {
+            let _ = acquire;
+            self.draw_pre_scene(scene, &frame_view, frame)
+        }
     }
 
     #[cfg(not(feature = "fast"))]
