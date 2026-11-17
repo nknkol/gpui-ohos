@@ -26,6 +26,15 @@ pub(crate) fn register(frames: &Rc<WindowFrames>) {
     });
 }
 
+/// Prefer `hz`, allow the arbiter down to half rate, never cap below `hz`.
+fn vote(hz: i32) -> ExpectedRateRange {
+    ExpectedRateRange {
+        min: (hz / 2).max(1),
+        max: hz,
+        expected: hz,
+    }
+}
+
 static NEXT_TOKEN: AtomicUsize = AtomicUsize::new(1);
 
 /// The binding owns the receiver and its callback liveness gate. A generation
@@ -50,11 +59,7 @@ impl NativeFrames {
         // NOTE: Do NOT enable `OH_NativeVSync_SetDVSyncSwitch(true)` on GLES (`eglSwapBuffers`)
         // without `OH_NativeWindow` `SET_UI_TIMESTAMP` ahead-of-phase buffer tagging; otherwise
         // Rosen compositor buffer-queue phase slips cause intermittent 2-way scroll ghosting.
-        let result = vsync.set_expected_frame_rate_range(ExpectedRateRange {
-            min: hz,
-            max: hz,
-            expected: hz,
-        });
+        let result = vsync.set_expected_frame_rate_range(vote(hz));
         if result != 0 {
             return Err(Error::from_reason(format!(
                 "NativeVSync frame-rate request failed: {result}"
@@ -93,19 +98,15 @@ impl NativeFrames {
             .ok()
             .filter(|hz| *hz > 0)
             .ok_or_else(|| Error::from_reason(format!("Invalid display refresh rate: {hz}")))?;
-        if self.hz != hz {
-            let result = self.vsync.set_expected_frame_rate_range(ExpectedRateRange {
-                min: hz,
-                max: hz,
-                expected: hz,
-            });
-            if result != 0 {
-                return Err(Error::from_reason(format!(
-                    "NativeVSync frame-rate request failed: {result}"
-                )));
-            }
-            self.hz = hz;
+        // Re-vote on every resume: an idle receiver's vote may have been dropped by the
+        // frame-rate arbiter, and a stale lower vote must never survive.
+        let result = self.vsync.set_expected_frame_rate_range(vote(hz));
+        if result != 0 {
+            return Err(Error::from_reason(format!(
+                "NativeVSync frame-rate request failed: {result}"
+            )));
         }
+        self.hz = hz;
         self.paused = false;
         self.token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
         self.request()

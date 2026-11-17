@@ -10,6 +10,9 @@ use openharmony_ability::{FrameInputDelivery, OpenHarmonyApp};
 
 #[cfg(feature = "native-vsync")]
 use super::native_frames::NativeFrames;
+
+#[cfg(feature = "native-vsync")]
+const MAX_PANEL_HZ: u32 = 120;
 use super::{
     frame_demand::{DeliveryChange, FrameDemand},
     window::OhosWindow,
@@ -185,7 +188,10 @@ impl WindowFrames {
 
     #[cfg(feature = "native-vsync")]
     fn register_delivery(&self, app: &OpenHarmonyApp) -> napi_ohos::Result<()> {
-        let hz = app.refresh_rate();
+        // `refresh_rate()` is the panel's CURRENT rate: after an idle LTPO drop it reads 60,
+        // and voting max=60 would pin the panel at 60Hz (self-reinforcing lock). Always vote
+        // for the panel's top rate instead.
+        let hz = app.refresh_rate().max(MAX_PANEL_HZ);
         if let Some(native) = self.native.borrow_mut().as_mut() {
             return native.resume(hz);
         }

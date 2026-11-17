@@ -713,7 +713,21 @@ def resolve_hnp_packages(
             hnp_path = resolve_path(item["path"], spec_dir)
             build_cmd = item.get("buildCmd")
             src_dir_raw = item.get("srcDir")
-            if build_cmd and (force_hnp or not hnp_path.is_file()):
+            # Rebuild when any declared input (or a file referenced by build_cmd) is newer
+            # than the cached archive, so script/source edits never ship a stale HNP.
+            stale = False
+            if hnp_path.is_file():
+                hnp_mtime = hnp_path.stat().st_mtime
+                inputs = [resolve_path(p, spec_dir) for p in item.get("inputs", [])]
+                if isinstance(build_cmd, list):
+                    inputs += [resolve_path(str(x), spec_dir) for x in build_cmd[1:]]
+                for inp in inputs:
+                    if inp.is_file() and inp.stat().st_mtime > hnp_mtime:
+                        print(f"[hnp] {inp} is newer than {hnp_path.name}; rebuilding")
+                        stale = True
+                        break
+            # `alwaysBuild`: build_cmd has its own fast content-fingerprint up-to-date check.
+            if build_cmd and (force_hnp or stale or item.get("alwaysBuild") or not hnp_path.is_file()):
                 cmd_list = (
                     ["/bin/sh", "-c", build_cmd]
                     if isinstance(build_cmd, str)
